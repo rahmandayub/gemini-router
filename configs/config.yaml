@@ -1,0 +1,14 @@
+server:
+    host: '127.0.0.1'
+    port: 18080
+
+gemini:
+    base_url: 'https://generativelanguage.googleapis.com'
+    api_keys:
+        - 'AIzaSy...'
+        - 'AIzaSy...'
+        - 'AIzaSy...'
+
+logging:
+    level: 'info' # debug, info, warn, error
+
