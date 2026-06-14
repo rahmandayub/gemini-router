@@ -3,12 +3,14 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/rahmandayub/gemini-router/internal/key"
 )
@@ -36,10 +38,18 @@ type OpenAIRequest struct {
 }
 
 type OpenAIMessage struct {
-	Role       string          `json:"role"`
-	Content    string          `json:"content,omitempty"`
-	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string          `json:"tool_call_id,omitempty"`
+	Role             string           `json:"role"`
+	Content          string           `json:"content"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"`
+	ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string           `json:"tool_call_id,omitempty"`
+}
+
+type OpenAIDelta struct {
+	Role             string           `json:"role,omitempty"`
+	Content          string           `json:"content"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"`
+	ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
 }
 
 type OpenAITool struct {
@@ -54,8 +64,9 @@ type OpenAIFunction struct {
 }
 
 type OpenAIToolCall struct {
-	ID       string           `json:"id"`
-	Type     string           `json:"type"`
+	Index    *int             `json:"index,omitempty"`
+	ID       string           `json:"id,omitempty"`
+	Type     string           `json:"type,omitempty"`
 	Function OpenAIToolCallFn `json:"function"`
 }
 
@@ -78,6 +89,7 @@ type GeminiContent struct {
 
 type GeminiPart struct {
 	Text             string              `json:"text,omitempty"`
+	Thought          bool                `json:"thought,omitempty"`
 	FunctionCall     *GeminiFuncCall     `json:"functionCall,omitempty"`
 	FunctionResponse *GeminiFuncResponse `json:"functionResponse,omitempty"`
 }
@@ -135,8 +147,8 @@ type OpenAIResponse struct {
 
 type OpenAIChoice struct {
 	Index        int            `json:"index"`
-	Message      OpenAIMessage  `json:"message,omitempty"`
-	Delta        *OpenAIMessage `json:"delta,omitempty"`
+	Message      *OpenAIMessage `json:"message,omitempty"`
+	Delta        *OpenAIDelta   `json:"delta,omitempty"`
 	FinishReason *string        `json:"finish_reason"`
 }
 
@@ -170,6 +182,15 @@ type OpenAIModel struct {
 	OwnedBy string `json:"owned_by"`
 }
 
+func generateID() string {
+	b := make([]byte, 16)
+	_, err := rand.Read(b)
+	if err != nil {
+		return fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("chatcmpl-%x", b)
+}
+
 func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -191,12 +212,14 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	geminiReq, err := translateToGemini(&openAIReq)
 	if err != nil {
+		log.Printf("[ERROR] translation error: %v", err)
 		http.Error(w, fmt.Sprintf("translation error: %v", err), http.StatusBadRequest)
 		return
 	}
 
 	geminiBody, err := json.Marshal(geminiReq)
 	if err != nil {
+		log.Printf("[ERROR] marshal error: %v", err)
 		http.Error(w, "failed to marshal gemini request", http.StatusInternalServerError)
 		return
 	}
@@ -218,7 +241,8 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	apiKey := h.pool.Next()
 	req.Header.Set("x-goog-api-key", apiKey)
 
-	log.Printf("[OPENAI] POST /v1/chat/completions -> model=%s stream=%v key_idx=0", openAIReq.Model, openAIReq.Stream)
+	reqJSON, _ := json.Marshal(openAIReq)
+	log.Printf("[OPENAI] POST /v1/chat/completions -> model=%s stream=%v key_idx=0 payload=%s", openAIReq.Model, openAIReq.Stream, string(reqJSON))
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -227,14 +251,17 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	id := generateID()
+	created := time.Now().Unix()
+
 	if openAIReq.Stream {
-		h.handleStreamResponse(w, resp, openAIReq.Model)
+		h.handleStreamResponse(w, resp, openAIReq.Model, id, created)
 	} else {
-		h.handleNonStreamResponse(w, resp, openAIReq.Model)
+		h.handleNonStreamResponse(w, resp, openAIReq.Model, id, created)
 	}
 }
 
-func (h *OpenAIHandler) handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model string) {
+func (h *OpenAIHandler) handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model string, id string, created int64) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, "failed to read upstream response", http.StatusBadGateway)
@@ -254,9 +281,10 @@ func (h *OpenAIHandler) handleNonStreamResponse(w http.ResponseWriter, resp *htt
 		return
 	}
 
-	openAIResp := translateFromGemini(&geminiResp, model)
+	openAIResp := translateFromGemini(&geminiResp, model, id, created)
 	respBody, err := json.Marshal(openAIResp)
 	if err != nil {
+		log.Printf("[ERROR] marshal response error: %v", err)
 		http.Error(w, "failed to marshal response", http.StatusInternalServerError)
 		return
 	}
@@ -265,7 +293,8 @@ func (h *OpenAIHandler) handleNonStreamResponse(w http.ResponseWriter, resp *htt
 	w.Write(respBody)
 }
 
-func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string) {
+func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, id string, created int64) {
+	log.Printf("[STREAM] handleStreamResponse called, status=%d", resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		w.Header().Set("Content-Type", "application/json")
@@ -277,6 +306,7 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -284,12 +314,22 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 		return
 	}
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
+	reader := bufio.NewReader(resp.Body)
 	sentAny := false
-	for scanner.Scan() {
-		line := scanner.Text()
+	hasToolCall := false
+	isFirst := true
+	globalToolCallIdx := 0
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[STREAM] error reading stream: %v", err)
+			}
+			break
+		}
+
+		line = strings.TrimRight(line, "\r\n")
 
 		data := ""
 		if strings.HasPrefix(line, "data: ") {
@@ -315,15 +355,43 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 		}
 
 		if len(geminiResp.Candidates) == 0 {
-			log.Printf("[STREAM] no candidates in chunk: %s", data)
 			continue
 		}
 
-		openAIChunk := translateStreamChunk(&geminiResp, model)
+		// Check if this chunk contains a tool call
+		candidate := geminiResp.Candidates[0]
+		for _, part := range candidate.Content.Parts {
+			if part.FunctionCall != nil {
+				hasToolCall = true
+			}
+		}
+
+		openAIChunk := translateStreamChunk(&geminiResp, model, isFirst, id, created)
+		isFirst = false
+
+		if hasToolCall {
+			for i := range openAIChunk.Choices {
+				if openAIChunk.Choices[i].FinishReason != nil && *openAIChunk.Choices[i].FinishReason == "stop" {
+					tc := "tool_calls"
+					openAIChunk.Choices[i].FinishReason = &tc
+				}
+				if openAIChunk.Choices[i].Delta != nil && len(openAIChunk.Choices[i].Delta.ToolCalls) > 0 {
+					for j := range openAIChunk.Choices[i].Delta.ToolCalls {
+						val := globalToolCallIdx
+						openAIChunk.Choices[i].Delta.ToolCalls[j].Index = &val
+						openAIChunk.Choices[i].Delta.ToolCalls[j].ID = fmt.Sprintf("%s_%d", openAIChunk.Choices[i].Delta.ToolCalls[j].ID, val)
+						globalToolCallIdx++
+					}
+				}
+			}
+		}
+
 		chunkData, err := json.Marshal(openAIChunk)
 		if err != nil {
 			continue
 		}
+
+		log.Printf("[STREAM] Sent chunk: %s", string(chunkData))
 
 		w.Write([]byte("data: "))
 		w.Write(chunkData)
@@ -388,16 +456,40 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 				})
 			}
 		case "tool":
-			var args json.RawMessage
+			var args interface{}
 			if msg.Content != "" {
-				args = json.RawMessage(msg.Content)
+				var parsedJSON interface{}
+				if err := json.Unmarshal([]byte(msg.Content), &parsedJSON); err == nil {
+					args = parsedJSON
+				} else {
+					args = msg.Content
+				}
+			} else {
+				args = ""
 			}
+			
+			name := msg.ToolCallID
+			name = strings.TrimPrefix(name, "call_")
+			if idx := strings.LastIndex(name, "_"); idx != -1 {
+				suffix := name[idx+1:]
+				isDigits := true
+				for _, r := range suffix {
+					if r < '0' || r > '9' {
+						isDigits = false
+						break
+					}
+				}
+				if isDigits && len(suffix) > 0 {
+					name = name[:idx]
+				}
+			}
+
 			contents = append(contents, GeminiContent{
 				Role: "function",
 				Parts: []GeminiPart{
 					{
 						FunctionResponse: &GeminiFuncResponse{
-							Name: msg.ToolCallID,
+							Name: name,
 							Response: map[string]interface{}{
 								"result": args,
 							},
@@ -410,6 +502,7 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 
 	if len(systemParts) > 0 {
 		geminiReq.SystemInstruction = &GeminiContent{
+			Role:  "system",
 			Parts: systemParts,
 		}
 	}
@@ -419,10 +512,14 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 	if len(req.Tools) > 0 {
 		tools := make([]GeminiTool, 0, len(req.Tools))
 		for _, t := range req.Tools {
+			cleaned, err := cleanSchema(t.Function.Parameters)
+			if err != nil {
+				cleaned = t.Function.Parameters
+			}
 			decl := GeminiFuncDecl{
 				Name:        t.Function.Name,
 				Description: t.Function.Description,
-				Parameters:  t.Function.Parameters,
+				Parameters:  cleaned,
 			}
 			tools = append(tools, GeminiTool{
 				FunctionDeclarations: []GeminiFuncDecl{decl},
@@ -446,11 +543,44 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 	return geminiReq, nil
 }
 
-func translateFromGemini(resp *GeminiResponse, model string) *OpenAIResponse {
+var unsupportedSchemaProps = map[string]bool{
+	"$comment":         true,
+	"$schema":          true,
+	"additionalProperties": true,
+	"enumDescriptions": true,
+}
+
+func cleanSchema(raw json.RawMessage) (json.RawMessage, error) {
+	var schema interface{}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		return nil, err
+	}
+	cleanNode(schema)
+	return json.Marshal(schema)
+}
+
+func cleanNode(node interface{}) {
+	switch v := node.(type) {
+	case map[string]interface{}:
+		for key := range v {
+			if unsupportedSchemaProps[key] {
+				delete(v, key)
+			} else {
+				cleanNode(v[key])
+			}
+		}
+	case []interface{}:
+		for _, item := range v {
+			cleanNode(item)
+		}
+	}
+}
+
+func translateFromGemini(resp *GeminiResponse, model string, id string, created int64) *OpenAIResponse {
 	openAIResp := &OpenAIResponse{
-		ID:      fmt.Sprintf("chatcmpl-%d", 1234567890),
+		ID:      id,
 		Object:  "chat.completion",
-		Created: 1234567890,
+		Created: created,
 		Model:   model,
 	}
 
@@ -472,16 +602,21 @@ func translateFromGemini(resp *GeminiResponse, model string) *OpenAIResponse {
 		}
 
 		var textParts []string
+		var reasoningParts []string
 		var toolCalls []OpenAIToolCall
 
 		for _, part := range candidate.Content.Parts {
 			if part.Text != "" {
-				textParts = append(textParts, part.Text)
+				if part.Thought {
+					reasoningParts = append(reasoningParts, part.Text)
+				} else {
+					textParts = append(textParts, part.Text)
+				}
 			}
 			if part.FunctionCall != nil {
 				args, _ := json.Marshal(part.FunctionCall.Args)
 				toolCalls = append(toolCalls, OpenAIToolCall{
-					ID:   fmt.Sprintf("call_%s", part.FunctionCall.Name),
+					ID:   fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, len(toolCalls)),
 					Type: "function",
 					Function: OpenAIToolCallFn{
 						Name:      part.FunctionCall.Name,
@@ -494,14 +629,18 @@ func translateFromGemini(resp *GeminiResponse, model string) *OpenAIResponse {
 		if len(textParts) > 0 {
 			msg.Content = strings.Join(textParts, "")
 		}
+		if len(reasoningParts) > 0 {
+			msg.ReasoningContent = strings.Join(reasoningParts, "")
+		}
 		if len(toolCalls) > 0 {
 			msg.ToolCalls = toolCalls
 			if msg.Content == "" {
 				msg.Content = ""
 			}
+			finishReason = "tool_calls"
 		}
 
-		choice.Message = msg
+		choice.Message = &msg
 	}
 
 	openAIResp.Choices = []OpenAIChoice{choice}
@@ -517,11 +656,11 @@ func translateFromGemini(resp *GeminiResponse, model string) *OpenAIResponse {
 	return openAIResp
 }
 
-func translateStreamChunk(resp *GeminiResponse, model string) *OpenAIResponse {
+func translateStreamChunk(resp *GeminiResponse, model string, isFirst bool, id string, created int64) *OpenAIResponse {
 	openAIResp := &OpenAIResponse{
-		ID:      fmt.Sprintf("chatcmpl-%d", 1234567890),
+		ID:      id,
 		Object:  "chat.completion.chunk",
-		Created: 1234567890,
+		Created: created,
 		Model:   model,
 	}
 
@@ -532,9 +671,10 @@ func translateStreamChunk(resp *GeminiResponse, model string) *OpenAIResponse {
 	candidate := resp.Candidates[0]
 	choice := OpenAIChoice{
 		Index: 0,
-		Delta: &OpenAIMessage{
-			Role: "assistant",
-		},
+		Delta: &OpenAIDelta{},
+	}
+	if isFirst {
+		choice.Delta.Role = "assistant"
 	}
 
 	if candidate.FinishReason != "" {
@@ -544,17 +684,24 @@ func translateStreamChunk(resp *GeminiResponse, model string) *OpenAIResponse {
 
 	if len(candidate.Content.Parts) > 0 {
 		var textParts []string
+		var reasoningParts []string
 		var toolCalls []OpenAIToolCall
 
 		for _, part := range candidate.Content.Parts {
 			if part.Text != "" {
-				textParts = append(textParts, part.Text)
+				if part.Thought {
+					reasoningParts = append(reasoningParts, part.Text)
+				} else {
+					textParts = append(textParts, part.Text)
+				}
 			}
 			if part.FunctionCall != nil {
+				idx := len(toolCalls)
 				args, _ := json.Marshal(part.FunctionCall.Args)
 				toolCalls = append(toolCalls, OpenAIToolCall{
-					ID:   fmt.Sprintf("call_%s", part.FunctionCall.Name),
-					Type: "function",
+					Index: &idx,
+					ID:    fmt.Sprintf("call_%s", part.FunctionCall.Name),
+					Type:  "function",
 					Function: OpenAIToolCallFn{
 						Name:      part.FunctionCall.Name,
 						Arguments: string(args),
@@ -565,6 +712,9 @@ func translateStreamChunk(resp *GeminiResponse, model string) *OpenAIResponse {
 
 		if len(textParts) > 0 {
 			choice.Delta.Content = strings.Join(textParts, "")
+		}
+		if len(reasoningParts) > 0 {
+			choice.Delta.ReasoningContent = strings.Join(reasoningParts, "")
 		}
 		if len(toolCalls) > 0 {
 			choice.Delta.ToolCalls = toolCalls

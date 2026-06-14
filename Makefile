@@ -1,5 +1,4 @@
 BINARY_NAME := gemini-router
-MODULE := github.com/rahmandayub/gemini-router
 
 INSTALL_DIR := $(HOME)/.local/bin
 CONFIG_DIR := $(HOME)/.config/gemini-router
@@ -22,6 +21,7 @@ install: build
 	@echo ""
 
 	@echo "Installing binary to $(INSTALL_DIR)..."
+	@systemctl --user stop $(BINARY_NAME) 2>/dev/null || true
 	@mkdir -p $(INSTALL_DIR)
 	@cp $(BINARY_NAME) $(INSTALL_DIR)/$(BINARY_NAME)
 	@chmod +x $(INSTALL_DIR)/$(BINARY_NAME)
@@ -33,11 +33,44 @@ install: build
 		read -p "Overwrite? [y/N] " overwrite; \
 		if [ "$$overwrite" != "y" ] && [ "$$overwrite" != "Y" ]; then \
 			echo "Keeping existing config."; \
-		else \
-			$(MAKE) --no-print-directory prompt-config; \
+			skip_config=1; \
 		fi; \
-	else \
-		$(MAKE) --no-print-directory prompt-config; \
+	fi; \
+	if [ -z "$$skip_config" ]; then \
+		echo ""; \
+		echo "--- Configuration Setup ---"; \
+		echo ""; \
+		read -p "Enter port [$(DEFAULT_PORT)]: " port; \
+		port=$${port:-$(DEFAULT_PORT)}; \
+		echo ""; \
+		echo "Enter API keys (empty line to finish):"; \
+		echo 'server:' > $(CONFIG_DST); \
+		echo '    host: "127.0.0.1"' >> $(CONFIG_DST); \
+		echo "    port: $$port" >> $(CONFIG_DST); \
+		echo '' >> $(CONFIG_DST); \
+		echo 'gemini:' >> $(CONFIG_DST); \
+		echo '    base_url: "https://generativelanguage.googleapis.com"' >> $(CONFIG_DST); \
+		echo '    api_keys:' >> $(CONFIG_DST); \
+		keys_count=0; \
+		while true; do \
+			read -p "  API key: " key; \
+			if [ -z "$$key" ]; then \
+				break; \
+			fi; \
+			echo "        - '$$key'" >> $(CONFIG_DST); \
+			keys_count=$$((keys_count + 1)); \
+			echo "  Key added"; \
+		done; \
+		if [ $$keys_count -eq 0 ]; then \
+			echo "Error: At least one API key is required!"; \
+			rm -f $(CONFIG_DST); \
+			exit 1; \
+		fi; \
+		echo '' >> $(CONFIG_DST); \
+		echo 'logging:' >> $(CONFIG_DST); \
+		echo '    level: "info"' >> $(CONFIG_DST); \
+		echo ""; \
+		echo "Config saved to $(CONFIG_DST) ($$keys_count keys)"; \
 	fi
 
 	@echo ""
@@ -71,42 +104,6 @@ install: build
 	@echo "  journalctl --user -u $(BINARY_NAME) -f"
 	@echo ""
 
-prompt-config:
-	@echo ""
-	@echo "--- Configuration Setup ---"
-	@echo ""
-	@read -p "Enter port [$(DEFAULT_PORT)]: " port; \
-	port=$${port:-$(DEFAULT_PORT)}; \
-	echo ""; \
-	echo "Enter API keys (empty line to finish):"; \
-	echo 'server:' > $(CONFIG_DST); \
-	echo '    host: "127.0.0.1"' >> $(CONFIG_DST); \
-	echo "    port: $$port" >> $(CONFIG_DST); \
-	echo '' >> $(CONFIG_DST); \
-	echo 'gemini:' >> $(CONFIG_DST); \
-	echo '    base_url: "https://generativelanguage.googleapis.com"' >> $(CONFIG_DST); \
-	echo '    api_keys:' >> $(CONFIG_DST); \
-	keys_count=0; \
-	while true; do \
-		read -p "  API key: " key; \
-		if [ -z "$$key" ]; then \
-			break; \
-		fi; \
-		echo "        - '$$key'" >> $(CONFIG_DST); \
-		keys_count=$$((keys_count + 1)); \
-		echo "  ✓ Key added"; \
-	done; \
-	if [ $$keys_count -eq 0 ]; then \
-		echo "Error: At least one API key is required!"; \
-		rm -f $(CONFIG_DST); \
-		exit 1; \
-	fi; \
-	echo '' >> $(CONFIG_DST); \
-	echo 'logging:' >> $(CONFIG_DST); \
-	echo '    level: "info"' >> $(CONFIG_DST); \
-	echo ""; \
-	echo "Config saved to $(CONFIG_DST) ($$keys_count keys)"
-
 uninstall:
 	@echo "Stopping and disabling service..."
 	@systemctl --user stop $(BINARY_NAME) 2>/dev/null || true
@@ -115,15 +112,14 @@ uninstall:
 	@echo "Removing binary..."
 	@rm -f $(INSTALL_DIR)/$(BINARY_NAME)
 
-	@echo "Removing config..."
-	@rm -rf $(CONFIG_DIR)
-
 	@echo "Removing service file..."
 	@rm -f $(SERVICE_FILE)
 	@systemctl --user daemon-reload
 
 	@echo ""
 	@echo "Uninstalled successfully!"
+	@echo "Config kept at $(CONFIG_DST)"
+	@echo "To remove config: rm -rf $(CONFIG_DIR)"
 
 clean:
 	@rm -f $(BINARY_NAME)
