@@ -965,20 +965,14 @@ func translateAnthropicToGemini(req *AnthropicRequest) (*GeminiRequest, error) {
 		genConfig.StopSequences = req.StopSequences
 	}
 
-	// Add thinking config if present
-	if req.Thinking != nil {
-		if req.Thinking.Type == "enabled" && req.Thinking.BudgetTokens != nil {
-			genConfig.ThinkingConfig = &GeminiThinkingConfig{
-				ThinkingBudget: *req.Thinking.BudgetTokens,
-			}
-			// Map thinking budget to max output tokens if not set
-			if genConfig.MaxOutputTokens == nil {
-				genConfig.MaxOutputTokens = req.Thinking.BudgetTokens
-			}
-		} else if req.Thinking.Type == "disabled" {
-			genConfig.ThinkingConfig = &GeminiThinkingConfig{
-				ThinkingBudget: 0,
-			}
+	// Add thinking config if present (only for models that support it, i.e., not Gemma models, and only if type is "enabled")
+	if req.Thinking != nil && req.Thinking.Type == "enabled" && req.Thinking.BudgetTokens != nil && !strings.Contains(strings.ToLower(req.Model), "gemma") {
+		genConfig.ThinkingConfig = &GeminiThinkingConfig{
+			ThinkingBudget: *req.Thinking.BudgetTokens,
+		}
+		// Map thinking budget to max output tokens if not set
+		if genConfig.MaxOutputTokens == nil {
+			genConfig.MaxOutputTokens = req.Thinking.BudgetTokens
 		}
 	}
 
