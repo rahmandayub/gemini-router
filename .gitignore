@@ -3,10 +3,8 @@
 *.exe~
 *.dll
 *.so
-*.dylib
-./gemini-router
+/gemini-router
 
-# Test binary
 *.test
 
 # Output of go coverage
