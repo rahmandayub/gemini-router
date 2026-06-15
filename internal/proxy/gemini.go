@@ -48,9 +48,9 @@ func (h *GeminiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	apiKey := h.pool.Next()
 	req.Header.Set("x-goog-api-key", apiKey)
 
-	log.Printf("[GEMINI] %s %s -> key_idx=%d", r.Method, path, 0)
+	log.Printf("[proxy/gemini] %s %s -> keys_total=%d", r.Method, path, h.pool.Len())
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := UpstreamClient.Do(req)
 	if err != nil {
 		http.Error(w, "failed to forward request to upstream", http.StatusBadGateway)
 		return

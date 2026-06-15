@@ -1,10 +1,10 @@
 # Binaries
-./gemini-router
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+./gemini-router
 
 # Test binary
 *.test
@@ -37,5 +37,3 @@ Thumbs.db
 
 # Logs
 *.log
-
-gemini-router

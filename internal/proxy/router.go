@@ -11,23 +11,26 @@ import (
 )
 
 type Router struct {
-	mux            *http.ServeMux
-	geminiHandler  *GeminiHandler
-	openaiHandler  *OpenAIHandler
-	baseURL        string
-	pool           *key.Pool
+	mux              *http.ServeMux
+	geminiHandler    *GeminiHandler
+	openaiHandler    *OpenAIHandler
+	anthropicHandler *AnthropicHandler
+	baseURL          string
+	pool             *key.Pool
 }
 
 func NewRouter(baseURL string, pool *key.Pool) *Router {
 	r := &Router{
-		mux:           http.NewServeMux(),
-		geminiHandler: NewGeminiHandler(baseURL, pool),
-		openaiHandler: NewOpenAIHandler(baseURL, pool),
-		baseURL:       strings.TrimRight(baseURL, "/"),
-		pool:          pool,
+		mux:              http.NewServeMux(),
+		geminiHandler:    NewGeminiHandler(baseURL, pool),
+		openaiHandler:    NewOpenAIHandler(baseURL, pool),
+		anthropicHandler: NewAnthropicHandler(baseURL, pool),
+		baseURL:          strings.TrimRight(baseURL, "/"),
+		pool:             pool,
 	}
 
 	r.mux.HandleFunc("/v1/chat/completions", r.openaiHandler.ServeHTTP)
+	r.mux.HandleFunc("/v1/messages", r.anthropicHandler.ServeHTTP)
 	r.mux.HandleFunc("/v1/models", r.modelsHandler)
 	r.mux.HandleFunc("/v1beta/", r.geminiHandler.ServeHTTP)
 	r.mux.HandleFunc("/health", r.healthHandler)
@@ -36,29 +39,7 @@ func NewRouter(baseURL string, pool *key.Pool) *Router {
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	path := req.URL.Path
-
-	if path == "/v1/chat/completions" {
-		r.openaiHandler.ServeHTTP(w, req)
-		return
-	}
-
-	if path == "/v1/models" {
-		r.modelsHandler(w, req)
-		return
-	}
-
-	if strings.HasPrefix(path, "/v1beta/") {
-		r.geminiHandler.ServeHTTP(w, req)
-		return
-	}
-
-	if path == "/health" {
-		r.healthHandler(w, req)
-		return
-	}
-
-	http.NotFound(w, req)
+	r.mux.ServeHTTP(w, req)
 }
 
 func (r *Router) modelsHandler(w http.ResponseWriter, req *http.Request) {
@@ -78,7 +59,7 @@ func (r *Router) modelsHandler(w http.ResponseWriter, req *http.Request) {
 	apiKey := r.pool.Next()
 	upstreamReq.Header.Set("x-goog-api-key", apiKey)
 
-	resp, err := http.DefaultClient.Do(upstreamReq)
+	resp, err := UpstreamClient.Do(upstreamReq)
 	if err != nil {
 		http.Error(w, "failed to fetch models from upstream", http.StatusBadGateway)
 		return

@@ -22,13 +22,14 @@ func main() {
 	}
 
 	pool := key.NewPool(cfg.Gemini.APIKeys)
+
 	router := proxy.NewRouter(cfg.Gemini.BaseURL, pool)
 
 	handler := middleware.Logging(router)
 
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	log.Printf("Starting Gemini Router on %s", addr)
-	log.Printf("Loaded %d API keys", pool.Len())
+	log.Printf("Loaded %d Gemini API keys", pool.Len())
 
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("Server failed: %v", err)

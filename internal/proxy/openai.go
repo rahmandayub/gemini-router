@@ -92,6 +92,12 @@ type GeminiPart struct {
 	Thought          bool                `json:"thought,omitempty"`
 	FunctionCall     *GeminiFuncCall     `json:"functionCall,omitempty"`
 	FunctionResponse *GeminiFuncResponse `json:"functionResponse,omitempty"`
+	InlineData       *GeminiInlineData   `json:"inlineData,omitempty"`
+}
+
+type GeminiInlineData struct {
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"`
 }
 
 type GeminiFuncCall struct {
@@ -186,9 +192,9 @@ func generateID() string {
 	b := make([]byte, 16)
 	_, err := rand.Read(b)
 	if err != nil {
-		return fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+		return fmt.Sprintf("%s%d", OpenAIIDPrefix, time.Now().UnixNano())
 	}
-	return fmt.Sprintf("chatcmpl-%x", b)
+	return fmt.Sprintf("%s%x", OpenAIIDPrefix, b)
 }
 
 func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -212,14 +218,14 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	geminiReq, err := translateToGemini(&openAIReq)
 	if err != nil {
-		log.Printf("[ERROR] translation error: %v", err)
+		log.Printf("[proxy/openai] translation error: %v", err)
 		http.Error(w, fmt.Sprintf("translation error: %v", err), http.StatusBadRequest)
 		return
 	}
 
 	geminiBody, err := json.Marshal(geminiReq)
 	if err != nil {
-		log.Printf("[ERROR] marshal error: %v", err)
+		log.Printf("[proxy/openai] marshal error: %v", err)
 		http.Error(w, "failed to marshal gemini request", http.StatusInternalServerError)
 		return
 	}
@@ -241,10 +247,13 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	apiKey := h.pool.Next()
 	req.Header.Set("x-goog-api-key", apiKey)
 
-	reqJSON, _ := json.Marshal(openAIReq)
-	log.Printf("[OPENAI] POST /v1/chat/completions -> model=%s stream=%v key_idx=0 payload=%s", openAIReq.Model, openAIReq.Stream, string(reqJSON))
+	if reqJSON, err := logPayload("[proxy/openai] request payload", openAIReq); err == nil && reqJSON != nil {
+		log.Printf("[proxy/openai] POST /v1/chat/completions -> model=%s stream=%v keys_total=%d payload=%s", openAIReq.Model, openAIReq.Stream, h.pool.Len(), string(reqJSON))
+	} else {
+		log.Printf("[proxy/openai] POST /v1/chat/completions -> model=%s stream=%v keys_total=%d", openAIReq.Model, openAIReq.Stream, h.pool.Len())
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := UpstreamClient.Do(req)
 	if err != nil {
 		http.Error(w, "failed to forward request to upstream", http.StatusBadGateway)
 		return
@@ -284,7 +293,7 @@ func (h *OpenAIHandler) handleNonStreamResponse(w http.ResponseWriter, resp *htt
 	openAIResp := translateFromGemini(&geminiResp, model, id, created)
 	respBody, err := json.Marshal(openAIResp)
 	if err != nil {
-		log.Printf("[ERROR] marshal response error: %v", err)
+		log.Printf("[proxy/openai] marshal response error: %v", err)
 		http.Error(w, "failed to marshal response", http.StatusInternalServerError)
 		return
 	}
@@ -294,7 +303,7 @@ func (h *OpenAIHandler) handleNonStreamResponse(w http.ResponseWriter, resp *htt
 }
 
 func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, id string, created int64) {
-	log.Printf("[STREAM] handleStreamResponse called, status=%d", resp.StatusCode)
+	log.Printf("[proxy/stream] handleStreamResponse called, status=%d", resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		w.Header().Set("Content-Type", "application/json")
@@ -324,7 +333,7 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("[STREAM] error reading stream: %v", err)
+				log.Printf("[proxy/stream] error reading stream: %v", err)
 			}
 			break
 		}
@@ -350,7 +359,7 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 
 		var geminiResp GeminiResponse
 		if err := json.Unmarshal([]byte(data), &geminiResp); err != nil {
-			log.Printf("[STREAM] parse error: %v raw=%s", err, data)
+			log.Printf("[proxy/stream] parse error: %v raw=%s", err, data)
 			continue
 		}
 
@@ -391,7 +400,7 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 			continue
 		}
 
-		log.Printf("[STREAM] Sent chunk: %s", string(chunkData))
+		log.Printf("[proxy/stream] sent chunk: %s", string(chunkData))
 
 		w.Write([]byte("data: "))
 		w.Write(chunkData)
@@ -401,7 +410,7 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 	}
 
 	if !sentAny {
-		log.Printf("[STREAM] warning: no chunks sent to client")
+		log.Printf("[proxy/stream] warning: no chunks sent to client")
 	}
 
 	w.Write([]byte("data: [DONE]\n\n"))
@@ -469,7 +478,7 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 			}
 			
 			name := msg.ToolCallID
-			name = strings.TrimPrefix(name, "call_")
+				name = strings.TrimPrefix(name, OpenAICallPrefix)
 			if idx := strings.LastIndex(name, "_"); idx != -1 {
 				suffix := name[idx+1:]
 				isDigits := true
@@ -616,7 +625,7 @@ func translateFromGemini(resp *GeminiResponse, model string, id string, created 
 			if part.FunctionCall != nil {
 				args, _ := json.Marshal(part.FunctionCall.Args)
 				toolCalls = append(toolCalls, OpenAIToolCall{
-					ID:   fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, len(toolCalls)),
+					ID:   fmt.Sprintf("%s%s_%d", OpenAICallPrefix, part.FunctionCall.Name, len(toolCalls)),
 					Type: "function",
 					Function: OpenAIToolCallFn{
 						Name:      part.FunctionCall.Name,
@@ -700,7 +709,7 @@ func translateStreamChunk(resp *GeminiResponse, model string, isFirst bool, id s
 				args, _ := json.Marshal(part.FunctionCall.Args)
 				toolCalls = append(toolCalls, OpenAIToolCall{
 					Index: &idx,
-					ID:    fmt.Sprintf("call_%s", part.FunctionCall.Name),
+					ID:    fmt.Sprintf("%s%s", OpenAICallPrefix, part.FunctionCall.Name),
 					Type:  "function",
 					Function: OpenAIToolCallFn{
 						Name:      part.FunctionCall.Name,
