@@ -236,67 +236,195 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	upstreamURL := fmt.Sprintf("%s/v1beta/models/%s:%s", h.geminiBaseURL, anthropicReq.Model, endpoint)
 
+	msgID := generateAnthropicID()
+	clientSupportsThinking := anthropicReq.Thinking != nil && anthropicReq.Thinking.Type == "enabled"
+
 	var resp *http.Response
 	var lastErr error
 	maxRetries := 3
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		apiKey := h.geminiKeys.Next()
-		
-		var req *http.Request
-		req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
-		if err != nil {
-			log.Printf("[proxy/anthropic] failed to create upstream request: %v", err)
-			http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
+	if anthropicReq.Stream {
+		// Write headers early to establish connection
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("x-request-id", msgID)
+		w.WriteHeader(http.StatusOK)
+
+		flusher, ok := w.(http.Flusher)
+		if ok {
+			// Send message_start immediately
+			msgStart := AnthropicStreamMessageStart{
+				Type: "message_start",
+				Message: &AnthropicResponse{
+					ID:    msgID,
+					Type:  "message",
+					Role:  "assistant",
+					Model: anthropicReq.Model,
+					Content: []AnthropicRespBlock{},
+					Usage: &AnthropicUsage{
+						InputTokens:              0,
+						OutputTokens:             0,
+						CacheCreationInputTokens: 0,
+						CacheReadInputTokens:     0,
+					},
+				},
+			}
+			eventData, _ := json.Marshal(msgStart)
+			WriteSSEEvent(w, "message_start", eventData)
+
+			// Send initial ping keepalive
+			pingEvent := map[string]interface{}{"type": "ping"}
+			pingData, _ := json.Marshal(pingEvent)
+			WriteSSEEvent(w, "ping", pingData)
+			flusher.Flush()
+		}
+
+		// Start keepalive ticker
+		stopKeepAlive := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					pingEvent := map[string]interface{}{"type": "ping"}
+					pingData, _ := json.Marshal(pingEvent)
+					WriteSSEEvent(w, "ping", pingData)
+				case <-stopKeepAlive:
+					return
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}()
+
+		// Run retry loop
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			apiKey := h.geminiKeys.Next()
+			
+			var req *http.Request
+			req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
+			if err != nil {
+				log.Printf("[proxy/anthropic] failed to create upstream request: %v", err)
+				close(stopKeepAlive)
+				return
+			}
+
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-goog-api-key", apiKey)
+
+			log.Printf("[proxy/anthropic] POST /v1/messages (attempt %d) -> model=%s stream=true", attempt+1, anthropicReq.Model)
+
+			resp, err = UpstreamClient.Do(req)
+			if err != nil {
+				lastErr = err
+				log.Printf("[proxy/anthropic] request failed (attempt %d): %v", attempt+1, err)
+				if r.Context().Err() != nil {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
+			if resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				log.Printf("[proxy/anthropic] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
+				lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+				resp = nil
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
+			break
+		}
+
+		close(stopKeepAlive)
+
+		if resp == nil {
+			log.Printf("[proxy/anthropic] all retries failed. Last error: %v", lastErr)
+			
+			// Send error as assistant text content to render in chat
+			errText := fmt.Sprintf("\n\n[Proxy Error: failed to forward request to upstream: %v]", lastErr)
+			WriteSSEEvent(w, "content_block_start", []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`))
+			
+			deltaEvent := AnthropicStreamContentBlockDelta{
+				Type:  "content_block_delta",
+				Index: 0,
+				Delta: &AnthropicStreamTextDelta{
+					Type: "text_delta",
+					Text: errText,
+				},
+			}
+			deltaBytes, _ := json.Marshal(deltaEvent)
+			WriteSSEEvent(w, "content_block_delta", deltaBytes)
+			WriteSSEEvent(w, "content_block_stop", []byte(`{"type":"content_block_stop","index":0}`))
+
+			errorEvent := map[string]interface{}{
+				"type": "error",
+				"error": map[string]interface{}{
+					"type":    "api_error",
+					"message": fmt.Sprintf("failed to forward request to upstream: %v", lastErr),
+				},
+			}
+			eventData, _ := json.Marshal(errorEvent)
+			WriteSSEEvent(w, "error", eventData)
+			WriteSSEEvent(w, "message_stop", []byte(`{"type":"message_stop"}`))
 			return
 		}
+		defer resp.Body.Close()
 
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("x-goog-api-key", apiKey)
-
-		if reqJSON, err := logPayload("[proxy/anthropic] request payload", anthropicReq); err == nil && reqJSON != nil {
-			log.Printf("[proxy/anthropic] POST /v1/messages (attempt %d) -> model=%s stream=%v payload=%s", attempt+1, anthropicReq.Model, anthropicReq.Stream, string(reqJSON))
-		} else {
-			log.Printf("[proxy/anthropic] POST /v1/messages (attempt %d) -> model=%s stream=%v", attempt+1, anthropicReq.Model, anthropicReq.Stream)
-		}
-
-		resp, err = UpstreamClient.Do(req)
-		if err != nil {
-			lastErr = err
-			log.Printf("[proxy/anthropic] request failed (attempt %d): %v", attempt+1, err)
-			if r.Context().Err() != nil {
-				break
-			}
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-
-		if resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			log.Printf("[proxy/anthropic] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
-			lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
-			resp = nil
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-
-		break
-	}
-
-	if resp == nil {
-		log.Printf("[proxy/anthropic] all retries failed. Last error: %v", lastErr)
-		http.Error(w, fmt.Sprintf("failed to forward request to upstream: %v", lastErr), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	msgID := generateAnthropicID()
-	clientSupportsThinking := anthropicReq.Thinking != nil && anthropicReq.Thinking.Type == "enabled"
-
-	if anthropicReq.Stream {
-		h.handleStreamResponse(w, resp, anthropicReq.Model, msgID, clientSupportsThinking)
+		h.handleStreamResponse(w, resp, anthropicReq.Model, msgID, clientSupportsThinking, true)
 	} else {
+		// Non-stream flow (normal retry loop)
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			apiKey := h.geminiKeys.Next()
+			
+			var req *http.Request
+			req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
+			if err != nil {
+				log.Printf("[proxy/anthropic] failed to create upstream request: %v", err)
+				http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
+				return
+			}
+
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-goog-api-key", apiKey)
+
+			log.Printf("[proxy/anthropic] POST /v1/messages (attempt %d) -> model=%s stream=false", attempt+1, anthropicReq.Model)
+
+			resp, err = UpstreamClient.Do(req)
+			if err != nil {
+				lastErr = err
+				log.Printf("[proxy/anthropic] request failed (attempt %d): %v", attempt+1, err)
+				if r.Context().Err() != nil {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
+			if resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				log.Printf("[proxy/anthropic] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
+				lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+				resp = nil
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
+			break
+		}
+
+		if resp == nil {
+			log.Printf("[proxy/anthropic] all retries failed. Last error: %v", lastErr)
+			http.Error(w, fmt.Sprintf("failed to forward request to upstream: %v", lastErr), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
 		h.handleNonStreamResponse(w, resp, anthropicReq.Model, msgID, clientSupportsThinking)
 	}
 }
@@ -334,13 +462,32 @@ func (h *AnthropicHandler) handleNonStreamResponse(w http.ResponseWriter, resp *
 	w.Write(respBody)
 }
 
-func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, msgID string, clientSupportsThinking bool) {
+func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, msgID string, clientSupportsThinking bool, headersWritten bool) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.WriteHeader(http.StatusOK)
+		log.Printf("[proxy/stream] Anthropic upstream returned non-OK status: %d, body: %s", resp.StatusCode, string(body))
+		if !headersWritten {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.WriteHeader(http.StatusOK)
+		}
+
+		// Send error as assistant text content to render in chat
+		errText := fmt.Sprintf("\n\n[Proxy Error: upstream returned error: %s]", string(body))
+		WriteSSEEvent(w, "content_block_start", []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`))
+		
+		deltaEvent := AnthropicStreamContentBlockDelta{
+			Type:  "content_block_delta",
+			Index: 0,
+			Delta: &AnthropicStreamTextDelta{
+				Type: "text_delta",
+				Text: errText,
+			},
+		}
+		deltaBytes, _ := json.Marshal(deltaEvent)
+		WriteSSEEvent(w, "content_block_delta", deltaBytes)
+		WriteSSEEvent(w, "content_block_stop", []byte(`{"type":"content_block_stop","index":0}`))
 
 		errorEvent := map[string]interface{}{
 			"type": "error",
@@ -351,19 +498,24 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 		}
 		eventData, _ := json.Marshal(errorEvent)
 		WriteSSEEvent(w, "error", eventData)
+		if headersWritten {
+			WriteSSEEvent(w, "message_stop", []byte(`{"type":"message_stop"}`))
+		}
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("x-request-id", msgID)
-	w.WriteHeader(http.StatusOK)
+	if !headersWritten {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("x-request-id", msgID)
+		w.WriteHeader(http.StatusOK)
+	}
 
 	reader := bufio.NewReader(resp.Body)
-	sentMessageStart := false
+	sentMessageStart := headersWritten
 	sentMessageStop := false
-	sentAny := false
+	sentAny := headersWritten
 	blockIndex := 0
 	currentBlockType := ""
 
@@ -388,11 +540,78 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 					Status  string `json:"status"`
 				} `json:"error"`
 			}
+			errMsg := "Upstream error encountered mid-stream"
 			if err := json.Unmarshal([]byte(fullJSON), &errResp); err == nil && errResp.Error.Message != "" {
 				log.Printf("[proxy/anthropic] upstream returned mid-stream error: %d - %s", errResp.Error.Code, errResp.Error.Message)
+				errMsg = errResp.Error.Message
 			} else {
 				log.Printf("[proxy/anthropic] upstream returned raw JSON mid-stream: %s", fullJSON)
 			}
+
+			// Ensure message_start is sent before sending the error event
+			if !sentMessageStart {
+				msgStart := AnthropicStreamMessageStart{
+					Type: "message_start",
+					Message: &AnthropicResponse{
+						ID:    msgID,
+						Type:  "message",
+						Role:  "assistant",
+						Model: model,
+						Content: []AnthropicRespBlock{},
+						Usage: &AnthropicUsage{
+							InputTokens:              0,
+							OutputTokens:             0,
+							CacheCreationInputTokens: 0,
+							CacheReadInputTokens:     0,
+						},
+					},
+				}
+				eventData, _ := json.Marshal(msgStart)
+				WriteSSEEvent(w, "message_start", eventData)
+				sentMessageStart = true
+			}
+
+			// Close previous block if any
+			if currentBlockType != "" {
+				WriteSSEEvent(w, "content_block_stop", []byte(fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, blockIndex)))
+				blockIndex++
+			}
+
+			// Send error as assistant text content to render in chat
+			errText := fmt.Sprintf("\n\n[Proxy Error: %s]", errMsg)
+			startEvent := AnthropicStreamContentBlockStart{
+				Type:  "content_block_start",
+				Index: blockIndex,
+				Block: &AnthropicRespTextBlock{
+					Type: "text",
+				},
+			}
+			eventData, _ := json.Marshal(startEvent)
+			WriteSSEEvent(w, "content_block_start", eventData)
+
+			deltaEvent := AnthropicStreamContentBlockDelta{
+				Type:  "content_block_delta",
+				Index: blockIndex,
+				Delta: &AnthropicStreamTextDelta{
+					Type: "text_delta",
+					Text: errText,
+				},
+			}
+			deltaBytes, _ := json.Marshal(deltaEvent)
+			WriteSSEEvent(w, "content_block_delta", deltaBytes)
+			WriteSSEEvent(w, "content_block_stop", []byte(fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, blockIndex)))
+
+			// Send error event
+			errorEvent := map[string]interface{}{
+				"type": "error",
+				"error": map[string]interface{}{
+					"type":    "api_error",
+					"message": errMsg,
+				},
+			}
+			eventData, _ = json.Marshal(errorEvent)
+			WriteSSEEvent(w, "error", eventData)
+
 			break
 		}
 
@@ -542,6 +761,10 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 				}
 				// Start tool_use block
 				toolID := generateToolUseID()
+				if part.ThoughtSignature != "" {
+					thoughtSignatureCache.Store(toolID, part.ThoughtSignature)
+					log.Printf("[proxy/anthropic] Stored stream thought signature for tool call %s", toolID)
+				}
 				startEvent := AnthropicStreamContentBlockStart{
 					Type:  "content_block_start",
 					Index: blockIndex,
@@ -789,13 +1012,21 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 						input = map[string]interface{}{}
 					}
 					argsJSON, _ := json.Marshal(input)
+					var thoughtSig string
+					if id != "" {
+						if val, ok := thoughtSignatureCache.Load(id); ok {
+							if sig, ok := val.(string); ok {
+								thoughtSig = sig
+							}
+						}
+					}
 					parts = append(parts, GeminiPart{
 						FunctionCall: &GeminiFuncCall{
 							Name: name,
 							Args: json.RawMessage(argsJSON),
 						},
+						ThoughtSignature: thoughtSig,
 					})
-					_ = id
 				case "tool_result":
 					toolUseID, _ := block["tool_use_id"].(string)
 					resultContent := block["content"]
@@ -902,6 +1133,10 @@ func translateFromGeminiToAnthropic(resp *GeminiResponse, model string, msgID st
 			}
 
 			toolID := generateToolUseID()
+			if part.ThoughtSignature != "" {
+				thoughtSignatureCache.Store(toolID, part.ThoughtSignature)
+				log.Printf("[proxy/anthropic] Stored non-stream thought signature for tool call %s", toolID)
+			}
 			contentBlocks = append(contentBlocks, &AnthropicRespToolUseBlock{
 				Type:  "tool_use",
 				ID:    toolID,

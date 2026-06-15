@@ -18,6 +18,6 @@ var UpstreamClient = &http.Client{
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: 15 * time.Second, // Timeout if headers don't arrive in 15 seconds
+		ResponseHeaderTimeout: 30 * time.Second, // Timeout if headers don't arrive in 30 seconds
 	},
 }

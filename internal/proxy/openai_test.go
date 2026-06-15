@@ -157,3 +157,71 @@ func TestTranslateToGemini(t *testing.T) {
 		t.Errorf("expected tool response 1 name to be 'tool2', got '%s'", toolBlock.Parts[1].FunctionResponse.Name)
 	}
 }
+
+func TestThoughtSignatureCache(t *testing.T) {
+	// Test caching during translateFromGemini
+	resp := &GeminiResponse{
+		Candidates: []GeminiCandidate{
+			{
+				Content: GeminiContent{
+					Role: "model",
+					Parts: []GeminiPart{
+						{
+							FunctionCall: &GeminiFuncCall{
+								Name: "list_dir",
+								Args: []byte(`{"path":"/"}`),
+							},
+							ThoughtSignature: "opaque_signature_abc_123",
+						},
+					},
+				},
+				FinishReason: "STOP",
+			},
+		},
+	}
+
+	reqID := "test-req-id"
+	translateFromGemini(resp, "gemini-3.1-flash-lite", reqID, 1234567890)
+
+	expectedToolCallID := "call_list_dir_test-req-id_0"
+	val, ok := thoughtSignatureCache.Load(expectedToolCallID)
+	if !ok {
+		t.Fatalf("expected thought_signature to be cached under %s", expectedToolCallID)
+	}
+	if val.(string) != "opaque_signature_abc_123" {
+		t.Errorf("expected cached signature to be 'opaque_signature_abc_123', got '%v'", val)
+	}
+
+	// Test retrieval during translateToGemini
+	req := &OpenAIRequest{
+		Model: "gemini-3.1-flash-lite",
+		Messages: []OpenAIMessage{
+			{
+				Role: "assistant",
+				ToolCalls: []OpenAIToolCall{
+					{
+						ID:       expectedToolCallID,
+						Type:     "function",
+						Function: OpenAIToolCallFn{Name: "list_dir", Arguments: `{"path":"/"}`},
+					},
+				},
+			},
+		},
+	}
+
+	geminiReq, err := translateToGemini(req)
+	if err != nil {
+		t.Fatalf("translateToGemini failed: %v", err)
+	}
+
+	if len(geminiReq.Contents) != 1 {
+		t.Fatalf("expected 1 content block, got %d", len(geminiReq.Contents))
+	}
+	parts := geminiReq.Contents[0].Parts
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+	if parts[0].ThoughtSignature != "opaque_signature_abc_123" {
+		t.Errorf("expected thoughtSignature to be injected as 'opaque_signature_abc_123', got '%s'", parts[0].ThoughtSignature)
+	}
+}

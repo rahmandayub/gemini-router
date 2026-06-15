@@ -93,6 +93,7 @@ type GeminiPart struct {
 	FunctionCall     *GeminiFuncCall     `json:"functionCall,omitempty"`
 	FunctionResponse *GeminiFuncResponse `json:"functionResponse,omitempty"`
 	InlineData       *GeminiInlineData   `json:"inlineData,omitempty"`
+	ThoughtSignature string              `json:"thoughtSignature,omitempty"`
 }
 
 type GeminiInlineData struct {
@@ -242,67 +243,201 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	upstreamURL := fmt.Sprintf("%s/v1beta/models/%s:%s", h.baseURL, openAIReq.Model, endpoint)
 
+	id := generateID()
+	created := time.Now().Unix()
+
 	var resp *http.Response
 	var lastErr error
 	maxRetries := 3
 
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		apiKey := h.pool.Next()
-		
-		var req *http.Request
-		req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
-		if err != nil {
-			log.Printf("[proxy/openai] failed to create upstream request: %v", err)
-			http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
+	if openAIReq.Stream {
+		// Write headers early to establish connection
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+
+		flusher, ok := w.(http.Flusher)
+		if ok {
+			// Write first chunk immediately
+			firstChunk := OpenAIResponse{
+				ID:      id,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   openAIReq.Model,
+				Choices: []OpenAIChoice{
+					{
+						Index: 0,
+						Delta: &OpenAIDelta{
+							Role:    "assistant",
+							Content: "",
+						},
+					},
+				},
+			}
+			chunkData, _ := json.Marshal(firstChunk)
+			w.Write([]byte("data: "))
+			w.Write(chunkData)
+			w.Write([]byte("\n\n"))
+			flusher.Flush()
+		}
+
+		// Start keepalive ticker
+		stopKeepAlive := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					w.Write([]byte(": keepalive\n\n"))
+					if flusher, ok := w.(http.Flusher); ok {
+						flusher.Flush()
+					}
+				case <-stopKeepAlive:
+					return
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}()
+
+		// Run retry loop
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			apiKey := h.pool.Next()
+			
+			var req *http.Request
+			req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
+			if err != nil {
+				log.Printf("[proxy/openai] failed to create upstream request: %v", err)
+				close(stopKeepAlive)
+				return
+			}
+
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-goog-api-key", apiKey)
+
+			log.Printf("[proxy/openai] POST /v1/chat/completions (attempt %d) -> model=%s stream=true", attempt+1, openAIReq.Model)
+
+			resp, err = UpstreamClient.Do(req)
+			if err != nil {
+				lastErr = err
+				log.Printf("[proxy/openai] request failed (attempt %d): %v", attempt+1, err)
+				if r.Context().Err() != nil {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
+			if resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				log.Printf("[proxy/openai] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
+				lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+				resp = nil
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
+			break
+		}
+
+		close(stopKeepAlive)
+
+		if resp == nil {
+			log.Printf("[proxy/openai] all retries failed. Last error: %v", lastErr)
+			
+			// Send error as assistant text content to render in chat
+			errText := fmt.Sprintf("\n\n[Proxy Error: failed to forward request to upstream: %v]", lastErr)
+			textChunk := OpenAIResponse{
+				ID:      id,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   openAIReq.Model,
+				Choices: []OpenAIChoice{
+					{
+						Index: 0,
+						Delta: &OpenAIDelta{
+							Content: errText,
+						},
+					},
+				},
+			}
+			chunkBytes, _ := json.Marshal(textChunk)
+			w.Write([]byte("data: "))
+			w.Write(chunkBytes)
+			w.Write([]byte("\n\n"))
+
+			errPayload := map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": fmt.Sprintf("failed to forward request to upstream: %v", lastErr),
+					"type":    "api_error",
+					"code":    "internal_error",
+				},
+			}
+			errBytes, _ := json.Marshal(errPayload)
+			w.Write([]byte("data: "))
+			w.Write(errBytes)
+			w.Write([]byte("\n\n"))
+			w.Write([]byte("data: [DONE]\n\n"))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
 			return
 		}
+		defer resp.Body.Close()
 
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("x-goog-api-key", apiKey)
-
-		if reqJSON, err := logPayload("[proxy/openai] request payload", openAIReq); err == nil && reqJSON != nil {
-			log.Printf("[proxy/openai] POST /v1/chat/completions (attempt %d) -> model=%s stream=%v keys_total=%d payload=%s", attempt+1, openAIReq.Model, openAIReq.Stream, h.pool.Len(), string(reqJSON))
-		} else {
-			log.Printf("[proxy/openai] POST /v1/chat/completions (attempt %d) -> model=%s stream=%v keys_total=%d", attempt+1, openAIReq.Model, openAIReq.Stream, h.pool.Len())
-		}
-
-		resp, err = UpstreamClient.Do(req)
-		if err != nil {
-			lastErr = err
-			log.Printf("[proxy/openai] request failed (attempt %d): %v", attempt+1, err)
-			if r.Context().Err() != nil {
-				break
-			}
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-
-		if resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			log.Printf("[proxy/openai] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
-			lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
-			resp = nil
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-
-		break
-	}
-
-	if resp == nil {
-		log.Printf("[proxy/openai] all retries failed. Last error: %v", lastErr)
-		http.Error(w, fmt.Sprintf("failed to forward request to upstream: %v", lastErr), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	id := generateID()
-	created := time.Now().Unix()
-
-	if openAIReq.Stream {
-		h.handleStreamResponse(w, resp, openAIReq.Model, id, created)
+		h.handleStreamResponse(w, resp, openAIReq.Model, id, created, true)
 	} else {
+		// Non-stream flow (normal retry loop)
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			apiKey := h.pool.Next()
+			
+			var req *http.Request
+			req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
+			if err != nil {
+				log.Printf("[proxy/openai] failed to create upstream request: %v", err)
+				http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
+				return
+			}
+
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("x-goog-api-key", apiKey)
+
+			log.Printf("[proxy/openai] POST /v1/chat/completions (attempt %d) -> model=%s stream=false", attempt+1, openAIReq.Model)
+
+			resp, err = UpstreamClient.Do(req)
+			if err != nil {
+				lastErr = err
+				log.Printf("[proxy/openai] request failed (attempt %d): %v", attempt+1, err)
+				if r.Context().Err() != nil {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
+			if resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
+				bodyBytes, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				log.Printf("[proxy/openai] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
+				lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+				resp = nil
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
+			break
+		}
+
+		if resp == nil {
+			log.Printf("[proxy/openai] all retries failed. Last error: %v", lastErr)
+			http.Error(w, fmt.Sprintf("failed to forward request to upstream: %v", lastErr), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
 		h.handleNonStreamResponse(w, resp, openAIReq.Model, id, created)
 	}
 }
@@ -339,20 +474,60 @@ func (h *OpenAIHandler) handleNonStreamResponse(w http.ResponseWriter, resp *htt
 	w.Write(respBody)
 }
 
-func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, id string, created int64) {
+func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, id string, created int64, headersWritten bool) {
 	log.Printf("[proxy/stream] handleStreamResponse called, status=%d", resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		w.Write(body)
+		log.Printf("[proxy/stream] OpenAI upstream returned non-OK status: %d, body: %s", resp.StatusCode, string(body))
+		if !headersWritten {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.StatusCode)
+			w.Write(body)
+		} else {
+			// Send error as assistant text content to render in chat
+			errText := fmt.Sprintf("\n\n[Proxy Error: upstream returned error: %s]", string(body))
+			textChunk := OpenAIResponse{
+				ID:      id,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []OpenAIChoice{
+					{
+						Index: 0,
+						Delta: &OpenAIDelta{
+							Content: errText,
+						},
+					},
+				},
+			}
+			chunkBytes, _ := json.Marshal(textChunk)
+			w.Write([]byte("data: "))
+			w.Write(chunkBytes)
+			w.Write([]byte("\n\n"))
+
+			// Write OpenAI-compliant error chunk
+			errPayload := map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": string(body),
+					"type":    "api_error",
+					"code":    "internal_error",
+				},
+			}
+			errBytes, _ := json.Marshal(errPayload)
+			w.Write([]byte("data: "))
+			w.Write(errBytes)
+			w.Write([]byte("\n\n"))
+			w.Write([]byte("data: [DONE]\n\n"))
+		}
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
+	if !headersWritten {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -363,7 +538,7 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 	reader := bufio.NewReader(resp.Body)
 	sentAny := false
 	hasToolCall := false
-	isFirst := true
+	isFirst := !headersWritten
 	globalToolCallIdx := 0
 
 	for {
@@ -387,11 +562,49 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 					Status  string `json:"status"`
 				} `json:"error"`
 			}
+			errMsg := "Upstream error encountered mid-stream"
 			if err := json.Unmarshal([]byte(fullJSON), &errResp); err == nil && errResp.Error.Message != "" {
 				log.Printf("[proxy/stream] upstream returned mid-stream error: %d - %s", errResp.Error.Code, errResp.Error.Message)
+				errMsg = errResp.Error.Message
 			} else {
 				log.Printf("[proxy/stream] upstream returned raw JSON mid-stream: %s", fullJSON)
 			}
+
+			// Send error as assistant text content to render in chat
+			errText := fmt.Sprintf("\n\n[Proxy Error: %s]", errMsg)
+			textChunk := OpenAIResponse{
+				ID:      id,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []OpenAIChoice{
+					{
+						Index: 0,
+						Delta: &OpenAIDelta{
+							Content: errText,
+						},
+					},
+				},
+			}
+			chunkBytes, _ := json.Marshal(textChunk)
+			w.Write([]byte("data: "))
+			w.Write(chunkBytes)
+			w.Write([]byte("\n\n"))
+
+			// Send OpenAI-compliant error chunk
+			errPayload := map[string]interface{}{
+				"error": map[string]interface{}{
+					"message": errMsg,
+					"type":    "api_error",
+					"code":    "internal_error",
+				},
+			}
+			errBytes, _ := json.Marshal(errPayload)
+			w.Write([]byte("data: "))
+			w.Write(errBytes)
+			w.Write([]byte("\n\n"))
+			flusher.Flush()
+
 			break
 		}
 
@@ -424,9 +637,16 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 
 		// Check if this chunk contains a tool call
 		candidate := geminiResp.Candidates[0]
+		localIdx := globalToolCallIdx
 		for _, part := range candidate.Content.Parts {
 			if part.FunctionCall != nil {
 				hasToolCall = true
+				if part.ThoughtSignature != "" {
+					toolCallID := fmt.Sprintf("%s%s_%s_%d", OpenAICallPrefix, part.FunctionCall.Name, id, localIdx)
+					thoughtSignatureCache.Store(toolCallID, part.ThoughtSignature)
+					log.Printf("[proxy/stream] Stored stream thought signature for tool call %s", toolCallID)
+				}
+				localIdx++
 			}
 		}
 
@@ -443,7 +663,7 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 					for j := range openAIChunk.Choices[i].Delta.ToolCalls {
 						val := globalToolCallIdx
 						openAIChunk.Choices[i].Delta.ToolCalls[j].Index = &val
-						openAIChunk.Choices[i].Delta.ToolCalls[j].ID = fmt.Sprintf("%s_%d", openAIChunk.Choices[i].Delta.ToolCalls[j].ID, val)
+						openAIChunk.Choices[i].Delta.ToolCalls[j].ID = fmt.Sprintf("%s_%s_%d", openAIChunk.Choices[i].Delta.ToolCalls[j].ID, id, val)
 						globalToolCallIdx++
 					}
 				}
@@ -502,11 +722,18 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 					if tc.Function.Arguments != "" {
 						args = json.RawMessage(tc.Function.Arguments)
 					}
+					var thoughtSig string
+					if val, ok := thoughtSignatureCache.Load(tc.ID); ok {
+						if sig, ok := val.(string); ok {
+							thoughtSig = sig
+						}
+					}
 					parts = append(parts, GeminiPart{
 						FunctionCall: &GeminiFuncCall{
 							Name: tc.Function.Name,
 							Args: args,
 						},
+						ThoughtSignature: thoughtSig,
 					})
 				}
 			}
@@ -680,14 +907,19 @@ func translateFromGemini(resp *GeminiResponse, model string, id string, created 
 			}
 			if part.FunctionCall != nil {
 				args, _ := json.Marshal(part.FunctionCall.Args)
+				toolCallID := fmt.Sprintf("%s%s_%s_%d", OpenAICallPrefix, part.FunctionCall.Name, id, len(toolCalls))
 				toolCalls = append(toolCalls, OpenAIToolCall{
-					ID:   fmt.Sprintf("%s%s_%d", OpenAICallPrefix, part.FunctionCall.Name, len(toolCalls)),
+					ID:   toolCallID,
 					Type: "function",
 					Function: OpenAIToolCallFn{
 						Name:      part.FunctionCall.Name,
 						Arguments: string(args),
 					},
 				})
+				if part.ThoughtSignature != "" {
+					thoughtSignatureCache.Store(toolCallID, part.ThoughtSignature)
+					log.Printf("[proxy] Stored non-stream thought signature for tool call %s", toolCallID)
+				}
 			}
 		}
 

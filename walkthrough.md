@@ -67,9 +67,13 @@ Our task was to make the proxy route and translate these outputs into OpenAI's a
   * Implemented an automatic retry loop in both `ServeHTTP` handlers (OpenAI and Anthropic). The proxy will retry the upstream request up to 3 times on temporary/network errors (500, 503, 429), automatically switching to another API key from the pool on each attempt.
   * Fixed the bug by explicitly setting `resp = nil` inside the retry blocks, ensuring that all-attempts-failed scenarios are correctly intercepted and returned as `502 Bad Gateway` errors.
 
-### K. Mid-Stream Raw JSON Error Handling
-* **Problem**: If the Gemini API returned a `500` error mid-stream, it wrote raw JSON error blocks to the connection instead of prefixing them with `data: `. This caused the stream parser to output cryptic `json.Unmarshal` errors line-by-line.
-* **Solution**: Implemented detection for raw JSON objects (lines starting with `{`) in `handleStreamResponse`. If detected, the proxy consumes the rest of the stream, parses the full JSON error payload, logs the exact upstream failure, and gracefully terminates the stream.
+### K. Mid-Stream Raw JSON Error Handling & Client Stop Signals
+* **Problem**: 
+  * If the Gemini API returned a `500` error mid-stream, it wrote raw JSON error blocks to the connection instead of prefixing them with `data: `. This caused the stream parser to output cryptic `json.Unmarshal` errors line-by-line.
+  * When the proxy exited the streaming loop prematurely on these errors, the connection closed abruptly without sending termination signals (`message_stop` for Anthropic, `[DONE]` for OpenAI). This left the client (VS Code Copilot) in a loading spinner state indefinitely, unaware that the stream had failed.
+* **Solution**: 
+  * Implemented detection for raw JSON objects (lines starting with `{`) in `handleStreamResponse`. If detected, the proxy consumes the rest of the stream, parses the full JSON error payload, logs the exact upstream failure, and gracefully terminates the stream.
+  * Fixed the hanging spinner by ensuring the proxy writes an explicit compliant `error` event/chunk to the client (to display the error message) followed by the standard termination packets (`message_stop`/`[DONE]`) before closing the connection, cleanly stopping the client's loader.
 
 ### M. Anthropic Thinking Block Rendering Issue & Connection Timeouts
 * **Problem**: 
@@ -82,7 +86,15 @@ Our task was to make the proxy route and translate these outputs into OpenAI's a
 
 ### N. Prevention of Indefinite Upstream Connection Hangs
 * **Problem**: When Gemini is overloaded, it can sometimes take over 60 seconds to respond with initial HTTP headers for the stream. Without an explicit connection timeout, the request hung inside `UpstreamClient.Do(req)` until the client itself timed out and closed the connection, wasting retry opportunities.
-* **Solution**: Configured the global `UpstreamClient` with `ResponseHeaderTimeout: 15 * time.Second` and custom keep-alives. If the upstream server fails to send headers within 15 seconds, the connection immediately times out, allowing the retry loop to quickly pivot to a different API key.
+* **Solution**: Configured the global `UpstreamClient` with `ResponseHeaderTimeout: 30 * time.Second` and custom keep-alives. If the upstream server fails to send headers within 30 seconds, the connection immediately times out, allowing the retry loop to quickly pivot to a different API key.
+
+### O. Instant Connection Handshakes & Background Keepalive Tickers
+* **Problem**: Even with a 15-second or 30-second connection retry timeout, waiting for multiple key retries and model queue latency (which can easily take 15-20+ seconds for large models like `gemma-4-31b-it`) still feels extremely slow to the client. The client's loading connection remains completely inactive, which can trigger strict client-side idle timeouts or keep the processing indicator hanging with no feedback.
+* **Solution**: 
+  * Restructured the streaming endpoints in both OpenAI and Anthropic proxy handlers. The proxy now immediately responds with `200 OK` headers and transmits the initial handshake chunk/packet (`message_start` for Anthropic, and the `role: assistant` chunk for OpenAI) at **0 seconds latency**.
+  * Spawns a background keepalive ticker that writes keepalive signals (Anthropic `ping` events or OpenAI comment lines `: keepalive\n\n`) to the client connection every 5 seconds.
+  * This keeps the connection fully active and resets the client's idle timeout while the main handler executes the retry loops and awaits the upstream Gemini connection behind the scenes.
+  * Once the upstream starts responding, the background ticker is cleanly terminated, and the proxy streams the model's actual tokens to the client.
 
 ---
 
