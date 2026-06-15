@@ -115,10 +115,15 @@ type GeminiFuncDecl struct {
 	Parameters  json.RawMessage `json:"parameters"`
 }
 
+type GeminiThinkingConfig struct {
+	ThinkingBudget int `json:"thinkingBudget"`
+}
+
 type GeminiGenerationConfig struct {
-	Temperature     *float64 `json:"temperature,omitempty"`
-	MaxOutputTokens *int     `json:"maxOutputTokens,omitempty"`
-	StopSequences   []string `json:"stopSequences,omitempty"`
+	Temperature     *float64              `json:"temperature,omitempty"`
+	MaxOutputTokens *int                  `json:"maxOutputTokens,omitempty"`
+	StopSequences   []string              `json:"stopSequences,omitempty"`
+	ThinkingConfig  *GeminiThinkingConfig `json:"thinkingConfig,omitempty"`
 }
 
 type GeminiResponse struct {
@@ -237,25 +242,56 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	upstreamURL := fmt.Sprintf("%s/v1beta/models/%s:%s", h.baseURL, openAIReq.Model, endpoint)
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
-	if err != nil {
-		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
-		return
+	var resp *http.Response
+	var lastErr error
+	maxRetries := 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		apiKey := h.pool.Next()
+		
+		var req *http.Request
+		req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
+		if err != nil {
+			log.Printf("[proxy/openai] failed to create upstream request: %v", err)
+			http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
+			return
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-goog-api-key", apiKey)
+
+		if reqJSON, err := logPayload("[proxy/openai] request payload", openAIReq); err == nil && reqJSON != nil {
+			log.Printf("[proxy/openai] POST /v1/chat/completions (attempt %d) -> model=%s stream=%v keys_total=%d payload=%s", attempt+1, openAIReq.Model, openAIReq.Stream, h.pool.Len(), string(reqJSON))
+		} else {
+			log.Printf("[proxy/openai] POST /v1/chat/completions (attempt %d) -> model=%s stream=%v keys_total=%d", attempt+1, openAIReq.Model, openAIReq.Stream, h.pool.Len())
+		}
+
+		resp, err = UpstreamClient.Do(req)
+		if err != nil {
+			lastErr = err
+			log.Printf("[proxy/openai] request failed (attempt %d): %v", attempt+1, err)
+			if r.Context().Err() != nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			log.Printf("[proxy/openai] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
+			lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		break
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	apiKey := h.pool.Next()
-	req.Header.Set("x-goog-api-key", apiKey)
-
-	if reqJSON, err := logPayload("[proxy/openai] request payload", openAIReq); err == nil && reqJSON != nil {
-		log.Printf("[proxy/openai] POST /v1/chat/completions -> model=%s stream=%v keys_total=%d payload=%s", openAIReq.Model, openAIReq.Stream, h.pool.Len(), string(reqJSON))
-	} else {
-		log.Printf("[proxy/openai] POST /v1/chat/completions -> model=%s stream=%v keys_total=%d", openAIReq.Model, openAIReq.Stream, h.pool.Len())
-	}
-
-	resp, err := UpstreamClient.Do(req)
-	if err != nil {
-		http.Error(w, "failed to forward request to upstream", http.StatusBadGateway)
+	if resp == nil {
+		log.Printf("[proxy/openai] all retries failed. Last error: %v", lastErr)
+		http.Error(w, fmt.Sprintf("failed to forward request to upstream: %v", lastErr), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -339,6 +375,24 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 		}
 
 		line = strings.TrimRight(line, "\r\n")
+
+		if strings.HasPrefix(strings.TrimSpace(line), "{") {
+			rest, _ := io.ReadAll(reader)
+			fullJSON := line + "\n" + string(rest)
+			var errResp struct {
+				Error struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+					Status  string `json:"status"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(fullJSON), &errResp); err == nil && errResp.Error.Message != "" {
+				log.Printf("[proxy/stream] upstream returned mid-stream error: %d - %s", errResp.Error.Code, errResp.Error.Message)
+			} else {
+				log.Printf("[proxy/stream] upstream returned raw JSON mid-stream: %s", fullJSON)
+			}
+			break
+		}
 
 		data := ""
 		if strings.HasPrefix(line, "data: ") {
@@ -437,16 +491,11 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 				},
 			})
 		case "assistant":
+			var parts []GeminiPart
 			if msg.Content != "" {
-				contents = append(contents, GeminiContent{
-					Role: "model",
-					Parts: []GeminiPart{
-						{Text: msg.Content},
-					},
-				})
+				parts = append(parts, GeminiPart{Text: msg.Content})
 			}
 			if len(msg.ToolCalls) > 0 {
-				parts := make([]GeminiPart, 0, len(msg.ToolCalls))
 				for _, tc := range msg.ToolCalls {
 					var args json.RawMessage
 					if tc.Function.Arguments != "" {
@@ -459,6 +508,8 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 						},
 					})
 				}
+			}
+			if len(parts) > 0 {
 				contents = append(contents, GeminiContent{
 					Role:  "model",
 					Parts: parts,
@@ -478,7 +529,7 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 			}
 			
 			name := msg.ToolCallID
-				name = strings.TrimPrefix(name, OpenAICallPrefix)
+			name = strings.TrimPrefix(name, OpenAICallPrefix)
 			if idx := strings.LastIndex(name, "_"); idx != -1 {
 				suffix := name[idx+1:]
 				isDigits := true
@@ -493,19 +544,23 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 				}
 			}
 
-			contents = append(contents, GeminiContent{
-				Role: "function",
-				Parts: []GeminiPart{
-					{
-						FunctionResponse: &GeminiFuncResponse{
-							Name: name,
-							Response: map[string]interface{}{
-								"result": args,
-							},
-						},
+			part := GeminiPart{
+				FunctionResponse: &GeminiFuncResponse{
+					Name: name,
+					Response: map[string]interface{}{
+						"result": args,
 					},
 				},
-			})
+			}
+
+			if len(contents) > 0 && contents[len(contents)-1].Role == "function" {
+				contents[len(contents)-1].Parts = append(contents[len(contents)-1].Parts, part)
+			} else {
+				contents = append(contents, GeminiContent{
+					Role:  "function",
+					Parts: []GeminiPart{part},
+				})
+			}
 		}
 	}
 

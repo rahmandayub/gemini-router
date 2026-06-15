@@ -103,3 +103,57 @@ func TestTranslateStreamChunk(t *testing.T) {
 		t.Errorf("expected Delta.ReasoningContent to be empty, got '%s'", chunk2.Choices[0].Delta.ReasoningContent)
 	}
 }
+
+func TestTranslateToGemini(t *testing.T) {
+	// Test grouping of tool result messages
+	req := &OpenAIRequest{
+		Model: "gemma-4-31b-it",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: "Call some tools"},
+			{Role: "assistant", Content: "Thinking...", ToolCalls: []OpenAIToolCall{
+				{ID: "call_tool1_0", Function: OpenAIToolCallFn{Name: "tool1", Arguments: `{"arg":1}`}},
+				{ID: "call_tool2_1", Function: OpenAIToolCallFn{Name: "tool2", Arguments: `{"arg":2}`}},
+			}},
+			{Role: "tool", ToolCallID: "call_tool1_0", Content: `{"result":1}`},
+			{Role: "tool", ToolCallID: "call_tool2_1", Content: `{"result":2}`},
+		},
+	}
+
+	geminiReq, err := translateToGemini(req)
+	if err != nil {
+		t.Fatalf("translateToGemini failed: %v", err)
+	}
+
+	if len(geminiReq.Contents) != 3 {
+		t.Fatalf("expected 3 content blocks, got %d", len(geminiReq.Contents))
+	}
+
+	// 1. User block
+	if geminiReq.Contents[0].Role != "user" {
+		t.Errorf("expected block 0 role to be 'user', got '%s'", geminiReq.Contents[0].Role)
+	}
+
+	// 2. Assistant block (should merge text and tool calls)
+	assistantBlock := geminiReq.Contents[1]
+	if assistantBlock.Role != "model" {
+		t.Errorf("expected block 1 role to be 'model', got '%s'", assistantBlock.Role)
+	}
+	if len(assistantBlock.Parts) != 3 {
+		t.Errorf("expected assistant block to have 3 parts (1 text + 2 function calls), got %d", len(assistantBlock.Parts))
+	}
+
+	// 3. Tool block (should group both consecutive tool responses into a single function block)
+	toolBlock := geminiReq.Contents[2]
+	if toolBlock.Role != "function" {
+		t.Errorf("expected block 2 role to be 'function', got '%s'", toolBlock.Role)
+	}
+	if len(toolBlock.Parts) != 2 {
+		t.Errorf("expected tool block to group 2 tool responses, got %d", len(toolBlock.Parts))
+	}
+	if toolBlock.Parts[0].FunctionResponse.Name != "tool1" {
+		t.Errorf("expected tool response 0 name to be 'tool1', got '%s'", toolBlock.Parts[0].FunctionResponse.Name)
+	}
+	if toolBlock.Parts[1].FunctionResponse.Name != "tool2" {
+		t.Errorf("expected tool response 1 name to be 'tool2', got '%s'", toolBlock.Parts[1].FunctionResponse.Name)
+	}
+}

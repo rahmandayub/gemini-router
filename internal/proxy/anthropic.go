@@ -236,39 +236,71 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	upstreamURL := fmt.Sprintf("%s/v1beta/models/%s:%s", h.geminiBaseURL, anthropicReq.Model, endpoint)
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
-	if err != nil {
-		http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
-		return
+	var resp *http.Response
+	var lastErr error
+	maxRetries := 3
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		apiKey := h.geminiKeys.Next()
+		
+		var req *http.Request
+		req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
+		if err != nil {
+			log.Printf("[proxy/anthropic] failed to create upstream request: %v", err)
+			http.Error(w, "failed to create upstream request", http.StatusInternalServerError)
+			return
+		}
+
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-goog-api-key", apiKey)
+
+		if reqJSON, err := logPayload("[proxy/anthropic] request payload", anthropicReq); err == nil && reqJSON != nil {
+			log.Printf("[proxy/anthropic] POST /v1/messages (attempt %d) -> model=%s stream=%v payload=%s", attempt+1, anthropicReq.Model, anthropicReq.Stream, string(reqJSON))
+		} else {
+			log.Printf("[proxy/anthropic] POST /v1/messages (attempt %d) -> model=%s stream=%v", attempt+1, anthropicReq.Model, anthropicReq.Stream)
+		}
+
+		resp, err = UpstreamClient.Do(req)
+		if err != nil {
+			lastErr = err
+			log.Printf("[proxy/anthropic] request failed (attempt %d): %v", attempt+1, err)
+			if r.Context().Err() != nil {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			log.Printf("[proxy/anthropic] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
+			lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+
+		break
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	apiKey := h.geminiKeys.Next()
-	req.Header.Set("x-goog-api-key", apiKey)
-
-	if reqJSON, err := logPayload("[proxy/anthropic] request payload", anthropicReq); err == nil && reqJSON != nil {
-		log.Printf("[proxy/anthropic] POST /v1/messages -> model=%s stream=%v payload=%s", anthropicReq.Model, anthropicReq.Stream, string(reqJSON))
-	} else {
-		log.Printf("[proxy/anthropic] POST /v1/messages -> model=%s stream=%v", anthropicReq.Model, anthropicReq.Stream)
-	}
-
-	resp, err := UpstreamClient.Do(req)
-	if err != nil {
-		http.Error(w, "failed to forward request to upstream", http.StatusBadGateway)
+	if resp == nil {
+		log.Printf("[proxy/anthropic] all retries failed. Last error: %v", lastErr)
+		http.Error(w, fmt.Sprintf("failed to forward request to upstream: %v", lastErr), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
 	msgID := generateAnthropicID()
+	clientSupportsThinking := anthropicReq.Thinking != nil && anthropicReq.Thinking.Type == "enabled"
 
 	if anthropicReq.Stream {
-		h.handleStreamResponse(w, resp, anthropicReq.Model, msgID)
+		h.handleStreamResponse(w, resp, anthropicReq.Model, msgID, clientSupportsThinking)
 	} else {
-		h.handleNonStreamResponse(w, resp, anthropicReq.Model, msgID)
+		h.handleNonStreamResponse(w, resp, anthropicReq.Model, msgID, clientSupportsThinking)
 	}
 }
 
-func (h *AnthropicHandler) handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model string, msgID string) {
+func (h *AnthropicHandler) handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model string, msgID string, clientSupportsThinking bool) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, "failed to read upstream response", http.StatusBadGateway)
@@ -288,7 +320,7 @@ func (h *AnthropicHandler) handleNonStreamResponse(w http.ResponseWriter, resp *
 		return
 	}
 
-	anthropicResp := translateFromGeminiToAnthropic(&geminiResp, model, msgID)
+	anthropicResp := translateFromGeminiToAnthropic(&geminiResp, model, msgID, clientSupportsThinking)
 	respBody, err := json.Marshal(anthropicResp)
 	if err != nil {
 		log.Printf("[proxy/anthropic] marshal response error: %v", err)
@@ -301,7 +333,7 @@ func (h *AnthropicHandler) handleNonStreamResponse(w http.ResponseWriter, resp *
 	w.Write(respBody)
 }
 
-func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, msgID string) {
+func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, msgID string, clientSupportsThinking bool) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -344,6 +376,24 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 		}
 
 		line = strings.TrimRight(line, "\r\n")
+
+		if strings.HasPrefix(strings.TrimSpace(line), "{") {
+			rest, _ := io.ReadAll(reader)
+			fullJSON := line + "\n" + string(rest)
+			var errResp struct {
+				Error struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+					Status  string `json:"status"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal([]byte(fullJSON), &errResp); err == nil && errResp.Error.Message != "" {
+				log.Printf("[proxy/anthropic] upstream returned mid-stream error: %d - %s", errResp.Error.Code, errResp.Error.Message)
+			} else {
+				log.Printf("[proxy/anthropic] upstream returned raw JSON mid-stream: %s", fullJSON)
+			}
+			break
+		}
 
 		data := ""
 		if strings.HasPrefix(line, "data: ") {
@@ -409,6 +459,9 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 		for _, part := range candidate.Content.Parts {
 			if part.Text != "" {
 				if part.Thought {
+					if !clientSupportsThinking {
+						continue
+					}
 					// Handle thinking content
 					if currentBlockType != "thinking" {
 						// Close previous block if any
@@ -620,8 +673,21 @@ func translateAnthropicToGemini(req *AnthropicRequest) (*GeminiRequest, error) {
 		case "user":
 			content := parseAnthropicContent(msg.Content, toolUseIDToName)
 			if len(content) > 0 {
+				hasFuncResponse := false
+				for _, p := range content {
+					if p.FunctionResponse != nil {
+						hasFuncResponse = true
+						break
+					}
+				}
+
+				role := "user"
+				if hasFuncResponse {
+					role = "function"
+				}
+
 				contents = append(contents, GeminiContent{
-					Role:  "user",
+					Role:  role,
 					Parts: content,
 				})
 			}
@@ -671,11 +737,18 @@ func translateAnthropicToGemini(req *AnthropicRequest) (*GeminiRequest, error) {
 	}
 
 	// Add thinking config if present
-	if req.Thinking != nil && req.Thinking.Type == "enabled" {
-		if req.Thinking.BudgetTokens != nil {
+	if req.Thinking != nil {
+		if req.Thinking.Type == "enabled" && req.Thinking.BudgetTokens != nil {
+			genConfig.ThinkingConfig = &GeminiThinkingConfig{
+				ThinkingBudget: *req.Thinking.BudgetTokens,
+			}
 			// Map thinking budget to max output tokens if not set
 			if genConfig.MaxOutputTokens == nil {
 				genConfig.MaxOutputTokens = req.Thinking.BudgetTokens
+			}
+		} else if req.Thinking.Type == "disabled" {
+			genConfig.ThinkingConfig = &GeminiThinkingConfig{
+				ThinkingBudget: 0,
 			}
 		}
 	}
@@ -778,7 +851,7 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 	return parts
 }
 
-func translateFromGeminiToAnthropic(resp *GeminiResponse, model string, msgID string) *AnthropicResponse {
+func translateFromGeminiToAnthropic(resp *GeminiResponse, model string, msgID string, clientSupportsThinking bool) *AnthropicResponse {
 	anthropicResp := &AnthropicResponse{
 		ID:    msgID,
 		Type:  "message",
@@ -801,10 +874,12 @@ func translateFromGeminiToAnthropic(resp *GeminiResponse, model string, msgID st
 	for _, part := range candidate.Content.Parts {
 		if part.Text != "" {
 			if part.Thought {
-				contentBlocks = append(contentBlocks, &AnthropicRespThinkingBlock{
-					Type:     "thinking",
-					Thinking: part.Text,
-				})
+				if clientSupportsThinking {
+					contentBlocks = append(contentBlocks, &AnthropicRespThinkingBlock{
+						Type:     "thinking",
+						Thinking: part.Text,
+					})
+				}
 			} else {
 				contentBlocks = append(contentBlocks, &AnthropicRespTextBlock{
 					Type: "text",
