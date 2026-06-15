@@ -282,6 +282,7 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp.Body.Close()
 			log.Printf("[proxy/openai] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
 			lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+			resp = nil
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}

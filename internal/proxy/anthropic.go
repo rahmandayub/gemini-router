@@ -276,6 +276,7 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			resp.Body.Close()
 			log.Printf("[proxy/anthropic] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
 			lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+			resp = nil
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
@@ -460,6 +461,11 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 			if part.Text != "" {
 				if part.Thought {
 					if !clientSupportsThinking {
+						// Send a ping keepalive to prevent connection timeout while model is thinking
+						pingEvent := map[string]interface{}{"type": "ping"}
+						pingData, _ := json.Marshal(pingEvent)
+						WriteSSEEvent(w, "ping", pingData)
+						sentAny = true
 						continue
 					}
 					// Handle thinking content

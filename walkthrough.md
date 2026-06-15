@@ -59,19 +59,30 @@ Our task was to make the proxy route and translate these outputs into OpenAI's a
 * **Problem**: Anthropic client sends tool results with role `"user"` and block type `"tool_result"`. The proxy translated this into a Gemini block with role `"user"` but containing `FunctionResponse` parts. Gemini requires `FunctionResponse` parts to have the `"function"` role, causing validation errors/hangs.
 * **Solution**: Updated `translateAnthropicToGemini` in [anthropic.go](file:///home/rahmandayub/Projects/gemini-router/internal/proxy/anthropic.go) to inspect user message parts and automatically change the Gemini content role to `"function"` if it contains any `FunctionResponse` parts.
 
-### J. High Availability & Key Failover/Retries
-* **Problem**: Gemini models (especially reasoning models like `gemma-4-31b-it`) can intermittently return `500 Internal error` or `429 Too Many Requests`. Previously, if a key failed, the proxy forwarded the failure directly, causing client crashes.
-* **Solution**: Implemented an automatic retry loop in both `ServeHTTP` handlers (OpenAI and Anthropic). The proxy will retry the upstream request up to 3 times on temporary/network errors (500, 503, 429), automatically switching to another API key from the pool on each attempt.
+#### J. High Availability & Key Failover/Retries
+* **Problem**: 
+  * Gemini models (especially reasoning models like `gemma-4-31b-it`) can intermittently return `500 Internal error` or `429 Too Many Requests`. Previously, if a key failed, the proxy forwarded the failure directly, causing client crashes.
+  * In the initial implementation of the retry loop, a bug existed where failed attempts did not set `resp = nil` when continuing the loop. If all attempts failed with 500/503/429, the loop exited with `resp != nil` (pointing to the closed/failed response), causing the handlers to skip error checks and attempt to stream from a closed body.
+* **Solution**: 
+  * Implemented an automatic retry loop in both `ServeHTTP` handlers (OpenAI and Anthropic). The proxy will retry the upstream request up to 3 times on temporary/network errors (500, 503, 429), automatically switching to another API key from the pool on each attempt.
+  * Fixed the bug by explicitly setting `resp = nil` inside the retry blocks, ensuring that all-attempts-failed scenarios are correctly intercepted and returned as `502 Bad Gateway` errors.
 
 ### K. Mid-Stream Raw JSON Error Handling
 * **Problem**: If the Gemini API returned a `500` error mid-stream, it wrote raw JSON error blocks to the connection instead of prefixing them with `data: `. This caused the stream parser to output cryptic `json.Unmarshal` errors line-by-line.
 * **Solution**: Implemented detection for raw JSON objects (lines starting with `{`) in `handleStreamResponse`. If detected, the proxy consumes the rest of the stream, parses the full JSON error payload, logs the exact upstream failure, and gracefully terminates the stream.
 
-### M. Anthropic Thinking Block Rendering Issue
-* **Problem**: If the client (like VS Code Copilot) does not support or request Claude 3.7's `thinking` block type, sending `thinking` blocks at index 0 makes the client ignore them. The client expects the final text response at index 0, resulting in the user seeing `"Sorry, no response was returned."`. Additionally, explicitly setting `thinkingBudget: 0` for models that do not support thinking budget configurations (like `gemma-4-31b-it`) throws a `400 Bad Request`.
+### M. Anthropic Thinking Block Rendering Issue & Connection Timeouts
+* **Problem**: 
+  * If the client (like VS Code Copilot) does not support or request Claude 3.7's `thinking` block type, sending `thinking` blocks at index 0 makes the client ignore them. The client expects the final text response at index 0, resulting in the user seeing `"Sorry, no response was returned."`. Additionally, explicitly setting `thinkingBudget: 0` for models that do not support thinking budget configurations (like `gemma-4-31b-it`) throws a `400 Bad Request`.
+  * When thinking blocks are filtered out (when client does not support thinking), the proxy sends nothing to the connection while the model is processing. For long-running reasoning tasks, this 60+ second silence causes the client to timeout the connection, producing a `502 Bad Gateway` (context canceled).
 * **Solution**: 
   * Only map `ThinkingConfig` to Gemini if the client explicitly requests thinking via `"thinking": {"type": "enabled", ...}`.
   * Dynamically track if the client supports thinking (`clientSupportsThinking`). If false, we completely filter out and skip all `Thought: true` blocks in both the streaming and non-streaming responses, ensuring the visible text response starts at index 0.
+  * When filtering/skipping thought blocks mid-stream, we send Anthropic-compliant `ping` events to the client. This transmits keep-alive bytes on the wire, resetting the client's idle timeout and keeping the connection active while the model works.
+
+### N. Prevention of Indefinite Upstream Connection Hangs
+* **Problem**: When Gemini is overloaded, it can sometimes take over 60 seconds to respond with initial HTTP headers for the stream. Without an explicit connection timeout, the request hung inside `UpstreamClient.Do(req)` until the client itself timed out and closed the connection, wasting retry opportunities.
+* **Solution**: Configured the global `UpstreamClient` with `ResponseHeaderTimeout: 15 * time.Second` and custom keep-alives. If the upstream server fails to send headers within 15 seconds, the connection immediately times out, allowing the retry loop to quickly pivot to a different API key.
 
 ---
 
