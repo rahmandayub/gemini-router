@@ -14,6 +14,7 @@ type Router struct {
 	mux              *http.ServeMux
 	geminiHandler    *GeminiHandler
 	openaiHandler    *OpenAIHandler
+	responsesHandler *ResponsesHandler
 	anthropicHandler *AnthropicHandler
 	baseURL          string
 	pool             *key.Pool
@@ -24,12 +25,14 @@ func NewRouter(baseURL string, pool *key.Pool) *Router {
 		mux:              http.NewServeMux(),
 		geminiHandler:    NewGeminiHandler(baseURL, pool),
 		openaiHandler:    NewOpenAIHandler(baseURL, pool),
+		responsesHandler: NewResponsesHandler(baseURL, pool),
 		anthropicHandler: NewAnthropicHandler(baseURL, pool),
 		baseURL:          strings.TrimRight(baseURL, "/"),
 		pool:             pool,
 	}
 
 	r.mux.HandleFunc("/v1/chat/completions", r.openaiHandler.ServeHTTP)
+	r.mux.HandleFunc("/v1/responses", r.responsesHandler.ServeHTTP)
 	r.mux.HandleFunc("/v1/messages", r.anthropicHandler.ServeHTTP)
 	r.mux.HandleFunc("/v1/models", r.modelsHandler)
 	r.mux.HandleFunc("/v1beta/", r.geminiHandler.ServeHTTP)

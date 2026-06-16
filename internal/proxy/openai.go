@@ -28,13 +28,13 @@ func NewOpenAIHandler(baseURL string, pool *key.Pool) *OpenAIHandler {
 }
 
 type OpenAIRequest struct {
-	Model       string            `json:"model"`
-	Messages    []OpenAIMessage   `json:"messages"`
-	Tools       []OpenAITool      `json:"tools,omitempty"`
-	Temperature *float64          `json:"temperature,omitempty"`
-	MaxTokens   *int              `json:"max_tokens,omitempty"`
-	Stop        []string          `json:"stop,omitempty"`
-	Stream      bool              `json:"stream,omitempty"`
+	Model       string          `json:"model"`
+	Messages    []OpenAIMessage `json:"messages"`
+	Tools       []OpenAITool    `json:"tools,omitempty"`
+	Temperature *float64        `json:"temperature,omitempty"`
+	MaxTokens   *int            `json:"max_tokens,omitempty"`
+	Stop        []string        `json:"stop,omitempty"`
+	Stream      bool            `json:"stream,omitempty"`
 }
 
 type OpenAIMessage struct {
@@ -53,8 +53,8 @@ type OpenAIDelta struct {
 }
 
 type OpenAITool struct {
-	Type     string          `json:"type"`
-	Function OpenAIFunction  `json:"function"`
+	Type     string         `json:"type"`
+	Function OpenAIFunction `json:"function"`
 }
 
 type OpenAIFunction struct {
@@ -76,15 +76,25 @@ type OpenAIToolCallFn struct {
 }
 
 type GeminiRequest struct {
-	Contents         []GeminiContent        `json:"contents,omitempty"`
-	SystemInstruction *GeminiContent        `json:"system_instruction,omitempty"`
-	Tools            []GeminiTool           `json:"tools,omitempty"`
-	GenerationConfig *GeminiGenerationConfig `json:"generationConfig,omitempty"`
+	Contents          []GeminiContent         `json:"contents,omitempty"`
+	SystemInstruction *GeminiContent          `json:"system_instruction,omitempty"`
+	Tools             []GeminiTool            `json:"tools,omitempty"`
+	ToolConfig        *GeminiToolConfig       `json:"toolConfig,omitempty"`
+	GenerationConfig  *GeminiGenerationConfig `json:"generationConfig,omitempty"`
+}
+
+type GeminiToolConfig struct {
+	FunctionCallingConfig *GeminiFunctionCallingConfig `json:"functionCallingConfig"`
+}
+
+type GeminiFunctionCallingConfig struct {
+	Mode                 string   `json:"mode,omitempty"`
+	AllowedFunctionNames []string `json:"allowedFunctionNames,omitempty"`
 }
 
 type GeminiContent struct {
-	Role  string        `json:"role,omitempty"`
-	Parts []GeminiPart  `json:"parts"`
+	Role  string       `json:"role,omitempty"`
+	Parts []GeminiPart `json:"parts"`
 }
 
 type GeminiPart struct {
@@ -122,19 +132,20 @@ type GeminiThinkingConfig struct {
 
 type GeminiGenerationConfig struct {
 	Temperature     *float64              `json:"temperature,omitempty"`
+	TopP            *float64              `json:"topP,omitempty"`
 	MaxOutputTokens *int                  `json:"maxOutputTokens,omitempty"`
 	StopSequences   []string              `json:"stopSequences,omitempty"`
 	ThinkingConfig  *GeminiThinkingConfig `json:"thinkingConfig,omitempty"`
 }
 
 type GeminiResponse struct {
-	Candidates    []GeminiCandidate     `json:"candidates"`
-	UsageMetadata *GeminiUsageMetadata  `json:"usageMetadata,omitempty"`
+	Candidates    []GeminiCandidate    `json:"candidates"`
+	UsageMetadata *GeminiUsageMetadata `json:"usageMetadata,omitempty"`
 }
 
 type GeminiCandidate struct {
-	Content       GeminiContent `json:"content"`
-	FinishReason  string        `json:"finishReason,omitempty"`
+	Content      GeminiContent `json:"content"`
+	FinishReason string        `json:"finishReason,omitempty"`
 }
 
 type GeminiUsageMetadata struct {
@@ -149,12 +160,12 @@ type GeminiFuncResponse struct {
 }
 
 type OpenAIResponse struct {
-	ID      string            `json:"id"`
-	Object  string            `json:"object"`
-	Created int64             `json:"created"`
-	Model   string            `json:"model"`
-	Choices []OpenAIChoice    `json:"choices"`
-	Usage   *OpenAIUsage      `json:"usage,omitempty"`
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Created int64          `json:"created"`
+	Model   string         `json:"model"`
+	Choices []OpenAIChoice `json:"choices"`
+	Usage   *OpenAIUsage   `json:"usage,omitempty"`
 }
 
 type OpenAIChoice struct {
@@ -305,7 +316,7 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Run retry loop
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			apiKey := h.pool.Next()
-			
+
 			var req *http.Request
 			req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
 			if err != nil {
@@ -347,7 +358,7 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if resp == nil {
 			log.Printf("[proxy/openai] all retries failed. Last error: %v", lastErr)
-			
+
 			// Send error as assistant text content to render in chat
 			errText := fmt.Sprintf("\n\n[Proxy Error: failed to forward request to upstream: %v]", lastErr)
 			textChunk := OpenAIResponse{
@@ -393,7 +404,7 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Non-stream flow (normal retry loop)
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			apiKey := h.pool.Next()
-			
+
 			var req *http.Request
 			req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
 			if err != nil {
@@ -755,7 +766,7 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 			} else {
 				args = ""
 			}
-			
+
 			name := msg.ToolCallID
 			name = strings.TrimPrefix(name, OpenAICallPrefix)
 			if idx := strings.LastIndex(name, "_"); idx != -1 {
@@ -836,10 +847,10 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 }
 
 var unsupportedSchemaProps = map[string]bool{
-	"$comment":         true,
-	"$schema":          true,
+	"$comment":             true,
+	"$schema":              true,
 	"additionalProperties": true,
-	"enumDescriptions": true,
+	"enumDescriptions":     true,
 }
 
 func cleanSchema(raw json.RawMessage) (json.RawMessage, error) {
