@@ -25,6 +25,9 @@ vendor/
 *.swo
 *~
 
+# Kilo plans
+.kilo/
+
 # OS
 .DS_Store
 Thumbs.db
