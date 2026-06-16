@@ -31,21 +31,21 @@ func NewAnthropicHandler(geminiBaseURL string, geminiKeys *key.Pool) *AnthropicH
 // Anthropic API types
 
 type AnthropicRequest struct {
-	Model       string              `json:"model"`
-	Messages    []AnthropicMessage  `json:"messages"`
-	System      json.RawMessage     `json:"system,omitempty"`
-	MaxTokens   int                 `json:"max_tokens"`
-	Temperature *float64            `json:"temperature,omitempty"`
-	StopSequences []string          `json:"stop_sequences,omitempty"`
-	Stream      bool                `json:"stream,omitempty"`
-	Tools       []AnthropicTool     `json:"tools,omitempty"`
-	ToolChoice  *AnthropicToolChoice `json:"tool_choice,omitempty"`
-	Thinking    *AnthropicThinking  `json:"thinking,omitempty"`
+	Model         string               `json:"model"`
+	Messages      []AnthropicMessage   `json:"messages"`
+	System        json.RawMessage      `json:"system,omitempty"`
+	MaxTokens     int                  `json:"max_tokens"`
+	Temperature   *float64             `json:"temperature,omitempty"`
+	StopSequences []string             `json:"stop_sequences,omitempty"`
+	Stream        bool                 `json:"stream,omitempty"`
+	Tools         []AnthropicTool      `json:"tools,omitempty"`
+	ToolChoice    *AnthropicToolChoice `json:"tool_choice,omitempty"`
+	Thinking      *AnthropicThinking   `json:"thinking,omitempty"`
 }
 
 type AnthropicMessage struct {
-	Role    string              `json:"role"`
-	Content AnthropicContent    `json:"content"`
+	Role    string           `json:"role"`
+	Content AnthropicContent `json:"content"`
 }
 
 type AnthropicContent interface{}
@@ -82,18 +82,18 @@ type AnthropicToolChoice struct {
 
 type AnthropicThinking struct {
 	Type         string `json:"type"`
-	BudgetTokens *int  `json:"budget_tokens,omitempty"`
+	BudgetTokens *int   `json:"budget_tokens,omitempty"`
 }
 
 type AnthropicResponse struct {
-	ID           string              `json:"id"`
-	Type         string              `json:"type"`
-	Role         string              `json:"role"`
+	ID           string               `json:"id"`
+	Type         string               `json:"type"`
+	Role         string               `json:"role"`
 	Content      []AnthropicRespBlock `json:"content"`
-	Model        string              `json:"model"`
-	StopReason   string              `json:"stop_reason,omitempty"`
-	StopSequence *string             `json:"stop_sequence,omitempty"`
-	Usage        *AnthropicUsage     `json:"usage"`
+	Model        string               `json:"model"`
+	StopReason   string               `json:"stop_reason,omitempty"`
+	StopSequence *string              `json:"stop_sequence,omitempty"`
+	Usage        *AnthropicUsage      `json:"usage"`
 }
 
 type AnthropicRespBlock interface{}
@@ -104,7 +104,7 @@ type AnthropicRespTextBlock struct {
 }
 
 type AnthropicRespThinkingBlock struct {
-	Type    string `json:"type"`
+	Type     string `json:"type"`
 	Thinking string `json:"thinking"`
 }
 
@@ -125,9 +125,9 @@ type AnthropicUsage struct {
 // Streaming types
 
 type AnthropicStreamEvent struct {
-	Type  string      `json:"type"`
-	Index int         `json:"index,omitempty"`
-	Delta interface{} `json:"delta,omitempty"`
+	Type    string             `json:"type"`
+	Index   int                `json:"index,omitempty"`
+	Delta   interface{}        `json:"delta,omitempty"`
 	Message *AnthropicResponse `json:"message,omitempty"`
 }
 
@@ -159,14 +159,14 @@ type AnthropicStreamInputJSONDelta struct {
 }
 
 type AnthropicStreamThinkingDelta struct {
-	Type      string `json:"type"`
-	Thinking  string `json:"thinking"`
+	Type     string `json:"type"`
+	Thinking string `json:"thinking"`
 }
 
 type AnthropicStreamMessageDelta struct {
-	Type  string              `json:"type"`
+	Type  string                 `json:"type"`
 	Delta *AnthropicMessageDelta `json:"delta"`
-	Usage *AnthropicUsage     `json:"usage,omitempty"`
+	Usage *AnthropicUsage        `json:"usage,omitempty"`
 }
 
 type AnthropicMessageDelta struct {
@@ -257,10 +257,10 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			msgStart := AnthropicStreamMessageStart{
 				Type: "message_start",
 				Message: &AnthropicResponse{
-					ID:    msgID,
-					Type:  "message",
-					Role:  "assistant",
-					Model: anthropicReq.Model,
+					ID:      msgID,
+					Type:    "message",
+					Role:    "assistant",
+					Model:   anthropicReq.Model,
 					Content: []AnthropicRespBlock{},
 					Usage: &AnthropicUsage{
 						InputTokens:              0,
@@ -302,7 +302,7 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Run retry loop
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			apiKey := h.geminiKeys.Next()
-			
+
 			var req *http.Request
 			req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
 			if err != nil {
@@ -344,11 +344,11 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		if resp == nil {
 			log.Printf("[proxy/anthropic] all retries failed. Last error: %v", lastErr)
-			
+
 			// Send error as assistant text content to render in chat
 			errText := fmt.Sprintf("\n\n[Proxy Error: failed to forward request to upstream: %v]", lastErr)
 			WriteSSEEvent(w, "content_block_start", []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`))
-			
+
 			deltaEvent := AnthropicStreamContentBlockDelta{
 				Type:  "content_block_delta",
 				Index: 0,
@@ -380,7 +380,7 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Non-stream flow (normal retry loop)
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			apiKey := h.geminiKeys.Next()
-			
+
 			var req *http.Request
 			req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
 			if err != nil {
@@ -476,7 +476,7 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 		// Send error as assistant text content to render in chat
 		errText := fmt.Sprintf("\n\n[Proxy Error: upstream returned error: %s]", string(body))
 		WriteSSEEvent(w, "content_block_start", []byte(`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`))
-		
+
 		deltaEvent := AnthropicStreamContentBlockDelta{
 			Type:  "content_block_delta",
 			Index: 0,
@@ -553,10 +553,10 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 				msgStart := AnthropicStreamMessageStart{
 					Type: "message_start",
 					Message: &AnthropicResponse{
-						ID:    msgID,
-						Type:  "message",
-						Role:  "assistant",
-						Model: model,
+						ID:      msgID,
+						Type:    "message",
+						Role:    "assistant",
+						Model:   model,
 						Content: []AnthropicRespBlock{},
 						Usage: &AnthropicUsage{
 							InputTokens:              0,
@@ -649,10 +649,10 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 			msgStart := AnthropicStreamMessageStart{
 				Type: "message_start",
 				Message: &AnthropicResponse{
-					ID:    msgID,
-					Type:  "message",
-					Role:  "assistant",
-					Model: model,
+					ID:      msgID,
+					Type:    "message",
+					Role:    "assistant",
+					Model:   model,
 					Content: []AnthropicRespBlock{},
 					Usage: &AnthropicUsage{
 						InputTokens:              0,
@@ -836,7 +836,6 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 	if sentMessageStart && !sentMessageStop {
 		WriteSSEEvent(w, "message_stop", []byte(`{"type":"message_stop"}`))
 	}
-
 
 }
 
@@ -1084,10 +1083,10 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 
 func translateFromGeminiToAnthropic(resp *GeminiResponse, model string, msgID string, clientSupportsThinking bool) *AnthropicResponse {
 	anthropicResp := &AnthropicResponse{
-		ID:    msgID,
-		Type:  "message",
-		Role:  "assistant",
-		Model: model,
+		ID:      msgID,
+		Type:    "message",
+		Role:    "assistant",
+		Model:   model,
 		Content: []AnthropicRespBlock{},
 	}
 
