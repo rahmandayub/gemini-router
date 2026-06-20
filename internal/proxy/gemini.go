@@ -45,7 +45,7 @@ func (h *GeminiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	apiKey := h.pool.Next()
+	apiKey := h.pool.Next(r.Context())
 	req.Header.Set("x-goog-api-key", apiKey)
 
 	log.Printf("[proxy/gemini] %s %s -> keys_total=%d", r.Method, path, h.pool.Len())

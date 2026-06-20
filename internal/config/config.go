@@ -9,8 +9,14 @@ import (
 
 type Config struct {
 	Server  ServerConfig  `yaml:"server"`
+	Auth    AuthConfig    `yaml:"auth"`
 	Gemini  GeminiConfig  `yaml:"gemini"`
 	Logging LoggingConfig `yaml:"logging"`
+}
+
+type AuthConfig struct {
+	Enabled bool     `yaml:"enabled"`
+	APIKeys []string `yaml:"api_keys"`
 }
 
 type ServerConfig struct {
@@ -19,8 +25,9 @@ type ServerConfig struct {
 }
 
 type GeminiConfig struct {
-	BaseURL string   `yaml:"base_url"`
-	APIKeys []string `yaml:"api_keys"`
+	BaseURL         string   `yaml:"base_url"`
+	APIKeys         []string `yaml:"api_keys"`
+	CooldownSeconds int      `yaml:"cooldown_seconds"`
 }
 
 type LoggingConfig struct {
@@ -58,6 +65,9 @@ func SetDefaults(cfg *Config) {
 	}
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = "info"
+	}
+	if cfg.Gemini.CooldownSeconds < 0 {
+		cfg.Gemini.CooldownSeconds = 60
 	}
 }
 

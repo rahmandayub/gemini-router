@@ -2,8 +2,15 @@ server:
     host: '127.0.0.1'
     port: 18080
 
+auth:
+    enabled: false
+    api_keys:
+        - 'sk-client-key-1'
+        - 'sk-client-key-2'
+
 gemini:
     base_url: 'https://generativelanguage.googleapis.com'
+    cooldown_seconds: 60
     api_keys:
         - 'AIzaSy...'
         - 'AIzaSy...'
@@ -11,4 +18,3 @@ gemini:
 
 logging:
     level: 'info' # debug, info, warn, error
-

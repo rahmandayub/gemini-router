@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -523,7 +524,7 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// Run retry loop
 		for attempt := 0; attempt < maxRetries; attempt++ {
-			apiKey := h.pool.Next()
+			apiKey := h.pool.Next(r.Context())
 
 			var req *http.Request
 			req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
@@ -552,8 +553,34 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
 				bodyBytes, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
-				log.Printf("[proxy/openai] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
-				lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+
+				if resp.StatusCode == http.StatusTooManyRequests {
+					dur := h.pool.DefaultCooldown()
+					if ra := resp.Header.Get("Retry-After"); ra != "" {
+						if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+							dur = time.Duration(secs) * time.Second
+						} else if t, err := http.ParseTime(ra); err == nil {
+							dur = time.Until(t)
+							if dur < 0 {
+								dur = 0
+							}
+						}
+					}
+					h.pool.MarkCooldown(apiKey, dur)
+
+					total, available, _ := h.pool.KeyStatus()
+					upstreamMsg := string(bodyBytes)
+					if upstreamMsg == "" {
+						upstreamMsg = fmt.Sprintf("key ending ...%s", apiKey[len(apiKey)-4:])
+					}
+					log.Printf("[proxy/openai] upstream returned 429 (attempt %d), key marked cooldown (%d/%d keys available), upstream: %s",
+						attempt+1, available, total, upstreamMsg)
+					lastErr = fmt.Errorf("rate limited: %s", upstreamMsg)
+				} else {
+					log.Printf("[proxy/openai] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
+					lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+				}
+
 				resp = nil
 				time.Sleep(50 * time.Millisecond)
 				continue
@@ -612,7 +639,7 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// Non-stream flow (normal retry loop)
 		for attempt := 0; attempt < maxRetries; attempt++ {
-			apiKey := h.pool.Next()
+			apiKey := h.pool.Next(r.Context())
 
 			var req *http.Request
 			req, err = http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(geminiBody))
@@ -641,8 +668,34 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if resp.StatusCode == http.StatusInternalServerError || resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusTooManyRequests {
 				bodyBytes, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
-				log.Printf("[proxy/openai] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
-				lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+
+				if resp.StatusCode == http.StatusTooManyRequests {
+					dur := h.pool.DefaultCooldown()
+					if ra := resp.Header.Get("Retry-After"); ra != "" {
+						if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
+							dur = time.Duration(secs) * time.Second
+						} else if t, err := http.ParseTime(ra); err == nil {
+							dur = time.Until(t)
+							if dur < 0 {
+								dur = 0
+							}
+						}
+					}
+					h.pool.MarkCooldown(apiKey, dur)
+
+					total, available, _ := h.pool.KeyStatus()
+					upstreamMsg := string(bodyBytes)
+					if upstreamMsg == "" {
+						upstreamMsg = fmt.Sprintf("key ending ...%s", apiKey[len(apiKey)-4:])
+					}
+					log.Printf("[proxy/openai] upstream returned 429 (attempt %d), key marked cooldown (%d/%d keys available), upstream: %s",
+						attempt+1, available, total, upstreamMsg)
+					lastErr = fmt.Errorf("rate limited: %s", upstreamMsg)
+				} else {
+					log.Printf("[proxy/openai] upstream returned status %d (attempt %d): %s", resp.StatusCode, attempt+1, string(bodyBytes))
+					lastErr = fmt.Errorf("upstream status %d: %s", resp.StatusCode, string(bodyBytes))
+				}
+
 				resp = nil
 				time.Sleep(50 * time.Millisecond)
 				continue

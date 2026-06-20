@@ -59,7 +59,7 @@ func (r *Router) modelsHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	apiKey := r.pool.Next()
+	apiKey := r.pool.Next(req.Context())
 	upstreamReq.Header.Set("x-goog-api-key", apiKey)
 
 	resp, err := UpstreamClient.Do(upstreamReq)
