@@ -246,7 +246,7 @@ func fetchAndEncodeImage(url string) (mimeType string, base64Data string, err er
 
 type OpenAIDelta struct {
 	Role             string           `json:"role,omitempty"`
-	Content          string           `json:"content,omitempty"`
+	Content          string           `json:"content"`
 	ReasoningContent string           `json:"reasoning_content,omitempty"`
 	ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
 }
@@ -379,7 +379,7 @@ type OpenAIChoice struct {
 	Index        int            `json:"index"`
 	Message      *OpenAIMessage `json:"message,omitempty"`
 	Delta        *OpenAIDelta   `json:"delta,omitempty"`
-	FinishReason *string        `json:"finish_reason,omitempty"`
+	FinishReason *string        `json:"finish_reason"`
 }
 
 type OpenAIUsage struct {
