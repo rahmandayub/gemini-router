@@ -876,3 +876,66 @@ func TestReasoningEffortToBudget(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractGeminiPartsFromContentInputAudio(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"input_audio","input_audio":{"data":"base64audiodata","format":"wav"}}]`)
+	parts := extractGeminiPartsFromContent(raw)
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+	if parts[0].InlineData == nil {
+		t.Fatal("expected InlineData")
+	}
+	if parts[0].InlineData.MimeType != "audio/wav" {
+		t.Errorf("expected 'audio/wav', got '%s'", parts[0].InlineData.MimeType)
+	}
+	if parts[0].InlineData.Data != "base64audiodata" {
+		t.Errorf("expected 'base64audiodata', got '%s'", parts[0].InlineData.Data)
+	}
+}
+
+func TestExtractGeminiPartsFromContentInputAudioMP3(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"input_audio","input_audio":{"data":"mp3data","format":"mp3"}}]`)
+	parts := extractGeminiPartsFromContent(raw)
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+	if parts[0].InlineData.MimeType != "audio/mp3" {
+		t.Errorf("expected 'audio/mp3', got '%s'", parts[0].InlineData.MimeType)
+	}
+}
+
+func TestExtractGeminiPartsFromContentAudioDataURI(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"audio_url","image_url":{"url":"data:audio/mp3;base64,audiodata"}}]`)
+	parts := extractGeminiPartsFromContent(raw)
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+	if parts[0].InlineData == nil {
+		t.Fatal("expected InlineData")
+	}
+	if parts[0].InlineData.MimeType != "audio/mp3" {
+		t.Errorf("expected 'audio/mp3', got '%s'", parts[0].InlineData.MimeType)
+	}
+}
+
+func TestExtractGeminiPartsFromContentMixedAllTypes(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"text","text":"Describe this"},
+		{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}},
+		{"type":"input_audio","input_audio":{"data":"audio123","format":"wav"}}
+	]`)
+	parts := extractGeminiPartsFromContent(raw)
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 parts, got %d", len(parts))
+	}
+	if parts[0].Text != "Describe this" {
+		t.Errorf("expected text 'Describe this', got '%s'", parts[0].Text)
+	}
+	if parts[1].InlineData == nil || parts[1].InlineData.MimeType != "image/png" {
+		t.Errorf("expected image/png inline data")
+	}
+	if parts[2].InlineData == nil || parts[2].InlineData.MimeType != "audio/wav" {
+		t.Errorf("expected audio/wav inline data")
+	}
+}

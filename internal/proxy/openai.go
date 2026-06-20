@@ -77,6 +77,10 @@ type OpenAIMessageContentPart struct {
 		URL    string `json:"url"`
 		Detail string `json:"detail,omitempty"`
 	} `json:"image_url,omitempty"`
+	InputAudio *struct {
+		Data   string `json:"data"`
+		Format string `json:"format,omitempty"`
+	} `json:"input_audio,omitempty"`
 }
 
 func parseOpenAIContent(raw json.RawMessage) string {
@@ -159,8 +163,47 @@ func extractGeminiPartsFromContent(raw json.RawMessage) []GeminiPart {
 					}
 				}
 			}
-		case "audio", "video", "document", "file":
-			log.Printf("[proxy/openai] unsupported content type '%s' dropped (only text and image_url are supported)", p.Type)
+		case "input_audio":
+			if p.InputAudio != nil && p.InputAudio.Data != "" {
+				mimeType := "audio/wav"
+				if p.InputAudio.Format != "" {
+					mimeType = "audio/" + p.InputAudio.Format
+				}
+				geminiParts = append(geminiParts, GeminiPart{
+					InlineData: &GeminiInlineData{
+						MimeType: mimeType,
+						Data:     p.InputAudio.Data,
+					},
+				})
+			}
+		case "audio_url", "video_url", "document_url", "file":
+			if p.ImageURL != nil && p.ImageURL.URL != "" {
+				if strings.HasPrefix(p.ImageURL.URL, "data:") {
+					parts := strings.SplitN(p.ImageURL.URL, ",", 2)
+					if len(parts) == 2 {
+						header := parts[0]
+						mimeType := strings.TrimPrefix(header, "data:")
+						mimeType = strings.TrimSuffix(mimeType, ";base64")
+						geminiParts = append(geminiParts, GeminiPart{
+							InlineData: &GeminiInlineData{
+								MimeType: mimeType,
+								Data:     parts[1],
+							},
+						})
+					}
+				} else if strings.HasPrefix(p.ImageURL.URL, "http://") || strings.HasPrefix(p.ImageURL.URL, "https://") {
+					if mimeType, data, err := fetchAndEncodeImage(p.ImageURL.URL); err == nil {
+						geminiParts = append(geminiParts, GeminiPart{
+							InlineData: &GeminiInlineData{
+								MimeType: mimeType,
+								Data:     data,
+							},
+						})
+					} else {
+						log.Printf("[proxy/openai] failed to fetch %s URL %s: %v", p.Type, p.ImageURL.URL, err)
+					}
+				}
+			}
 		default:
 			log.Printf("[proxy/openai] unknown content type '%s' dropped", p.Type)
 		}

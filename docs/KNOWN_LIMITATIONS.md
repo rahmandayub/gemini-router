@@ -1,12 +1,56 @@
 # Known Limitations & Accepted Technical Debt
 
 Documented during the Translation Layer Compatibility Audit (2026-06-20).
-These issues were identified but intentionally not fixed — the cost/risk of fixing
-exceeds the practical impact.
+Updated after addressing audit findings (2026-06-20).
 
 ---
 
-## 1. Tool Call ID Encoding Is Fragile (Bugs #1, #4, #8)
+## Fixed Issues (2026-06-20)
+
+The following issues from the original audit have been addressed:
+
+### Reasoning Item Duplication in Responses Streaming (Bug #9)
+- **Fixed in**: `responses.go`
+- **Change**: Added `reasoningCompleted` flag to track whether reasoning was ever
+  streamed. The final `response.completed` output now always includes reasoning
+  items if reasoning was present, even if the reasoning block was closed before
+  the finish reason arrived.
+
+### Output Index Edge Case in Responses Streaming (Bug #3)
+- **Fixed in**: `responses.go`
+- **Change**: Added proper item transition handling. When a function_call arrives
+  while a text item is in progress, the text item is properly closed (via
+  `content_part.done` and `output_item.done` events) before the function_call
+  item starts. This prevents output index collisions between text and function
+  call items.
+
+### Audio/Video/Document Content Support (OpenAI Path)
+- **Fixed in**: `openai.go`
+- **Change**: Added support for `input_audio` content type (OpenAI's audio format
+  with base64 data and format field). Also added support for `audio_url`,
+  `video_url`, `document_url`, and `file` content types that use the `image_url`
+  field structure for URL-based content. All non-text content is forwarded to
+  Gemini as `InlineData` with the appropriate MIME type.
+
+### Audio Content Support (Anthropic Path)
+- **Fixed in**: `anthropic.go`
+- **Change**: Added `audio` content block type handling in `parseAnthropicContent`.
+  Supports both base64 source (direct InlineData) and URL source (fetch + encode).
+
+### Metadata Passthrough (Responses API)
+- **Fixed in**: `responses.go`
+- **Change**: Added `Metadata` field to `ResponsesRequest` and forward it to the
+  `Response` object in both streaming and non-streaming paths.
+
+### New Tests
+- Added 10 new test cases covering audio content, metadata passthrough, and mixed
+  content types. Total test count: 122 (up from 78).
+
+---
+
+## Remaining Accepted Limitations
+
+### 1. Tool Call ID Encoding Is Fragile (Bug #1, #4, #8)
 
 **Files**: `openai.go:833-834`, `openai.go:958-973`
 
@@ -32,7 +76,7 @@ might construct their own, or if the ID generation format changes.
 
 ---
 
-## 2. `function_call_arguments.done` Delta Contains Full Arguments (Bug #6)
+### 2. `function_call_arguments.done` Delta Contains Full Arguments (Bug #6)
 
 **File**: `responses.go:1080-1092`
 
@@ -50,30 +94,7 @@ work correctly. No known SDK breaks on this behavior.
 
 ---
 
-## 3. Output Index Edge Cases in Responses Streaming (Bug #7)
-
-**File**: `responses.go:1146-1264`
-
-**What**: When the finish reason arrives in the same chunk as the last content,
-the `outputIndex` tracking for reasoning → text → function call transitions may
-produce off-by-one indices in rare edge cases.
-
-**Why not fixed**: The code tracks `outputIndex` correctly for all common patterns:
-reasoning-then-text, reasoning-then-function-call, text-only, function-call-only.
-The edge case only manifests when reasoning completes and the finish reason arrives
-in the exact same Gemini SSE chunk, which is extremely rare since Gemini typically
-sends finish reason in a separate final chunk. Fixing this would require a more
-complex state machine with marginal benefit.
-
-**Risk**: Low. In practice, Gemini separates finish reason from content chunks.
-If a client receives a misaligned index, the content is still correct — only the
-index metadata is wrong.
-
-**When to revisit**: If integration testing reveals this edge case in production.
-
----
-
-## 4. `top_k` Unavailable Through OpenAI Interface (Bug #10)
+### 3. `top_k` Unavailable Through OpenAI Interface (Bug #10)
 
 **File**: `openai.go` (OpenAIRequest struct)
 
@@ -90,7 +111,7 @@ protocol compatibility and confuse clients that validate against the OpenAI sche
 
 ---
 
-## 5. `n > 1` Response Handling Uses Only First Candidate (All Paths)
+### 4. `n > 1` Response Handling Uses Only First Candidate (All Paths)
 
 **Files**: `openai.go:1150`, `anthropic.go:1152`, `responses.go:488`
 
@@ -111,7 +132,7 @@ documented behavior for translation proxies. Most real-world usage is `n = 1`.
 
 ---
 
-## 6. `strict` Mode on JSON Schema Not Forwarded to Gemini
+### 5. `strict` Mode on JSON Schema Not Forwarded to Gemini
 
 **Files**: `openai.go:55-59`, `responses.go:53-58`
 
@@ -131,7 +152,7 @@ enforcement is minimal for most use cases.
 
 ---
 
-## 7. Cache Token Accounting Hardcoded to Zero (Anthropic Path)
+### 6. Cache Token Accounting Hardcoded to Zero (Anthropic Path)
 
 **File**: `anthropic.go:1206-1215`
 
@@ -148,7 +169,7 @@ Gemini does not expose this information.
 
 ---
 
-## 8. `stop_sequence` Not Mapped in Anthropic Response
+### 7. `stop_sequence` Not Mapped in Anthropic Response
 
 **File**: `anthropic.go:1155`
 
@@ -162,3 +183,56 @@ occurred (`STOP`) but does not specify which stop sequence was matched. Returnin
 
 **Risk**: None. Clients that need stop sequence information cannot get it through
 this translation layer due to upstream limitations.
+
+---
+
+### 8. Stateless Mode Limitations (Responses API)
+
+**File**: `responses.go`
+
+**What**: The following Responses API features are not implemented due to the
+stateless proxy design:
+- `previous_response_id` — logged and ignored
+- `store` — parsed but not used
+- `conversation` object — not implemented
+- `include` parameter — parsed but not forwarded
+- `background` mode — not forwarded
+- `truncation` — not forwarded
+
+**Why not fixed**: These features require server-side state management (conversation
+history, stored responses, background processing). The proxy is designed to be
+stateless for simplicity and horizontal scalability.
+
+**Risk**: Low. Clients using these features will receive responses but without the
+stateful behavior they expect. This is documented behavior for a stateless proxy.
+
+**When to revisit**: If stateful proxy mode is implemented.
+
+---
+
+### 9. `logprobs` / `refusal` / `moderation` Not Forwarded (OpenAI Path)
+
+**File**: `openai.go`
+
+**What**: OpenAI's `logprobs`, `refusal`, and `moderation` response fields are
+not forwarded because Gemini does not provide equivalent data.
+
+**Why not fixed**: No source data. Gemini's response format does not include log
+probabilities, refusal messages, or moderation results.
+
+**Risk**: None. Clients that check these fields will receive null/empty values,
+which is correct behavior.
+
+---
+
+### 10. `reasoning_tokens` / `cached_tokens` Hardcoded to Zero (Responses Path)
+
+**File**: `responses.go`
+
+**What**: `usage.output_tokens_details.reasoning_tokens` and
+`usage.input_tokens_details.cached_tokens` are hardcoded to `0` in the Responses
+API usage. Gemini's `usageMetadata` does not provide these breakdowns.
+
+**Why not fixed**: No source data. Gemini only provides aggregate token counts.
+
+**Risk**: None. Clients that check these fields will see `0`, which is accurate.

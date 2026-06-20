@@ -885,6 +885,74 @@ func TestExtractTextFromJSONRawMessageArray(t *testing.T) {
 	}
 }
 
+func TestTranslateResponsesToGeminiWithMetadata(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "gemini-2.5-flash",
+		Input: json.RawMessage(`"test"`),
+		Metadata: map[string]string{
+			"user_id": "12345",
+			"session": "abc",
+		},
+	}
+
+	geminiReq, err := translateResponsesToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if geminiReq == nil {
+		t.Fatal("expected gemini request")
+	}
+}
+
+func TestTranslateGeminiToResponseWithMetadata(t *testing.T) {
+	geminiResp := &GeminiResponse{
+		Candidates: []GeminiCandidate{
+			{
+				Content:      GeminiContent{Role: "model", Parts: []GeminiPart{{Text: "Hello"}}},
+				FinishReason: "STOP",
+			},
+		},
+		UsageMetadata: &GeminiUsageMetadata{
+			PromptTokenCount:     5,
+			CandidatesTokenCount: 3,
+			TotalTokenCount:      8,
+		},
+	}
+
+	req := &ResponsesRequest{
+		Model: "gemini-2.5-flash",
+		Metadata: map[string]string{
+			"key": "value",
+		},
+	}
+
+	resp := translateGeminiToResponse(geminiResp, "gemini-2.5-flash", req)
+
+	if resp.Metadata == nil {
+		t.Fatal("expected metadata to be forwarded")
+	}
+	if resp.Metadata["key"] != "value" {
+		t.Errorf("expected metadata key=value, got %v", resp.Metadata)
+	}
+}
+
+func TestTranslateGeminiToResponseWithoutMetadata(t *testing.T) {
+	geminiResp := &GeminiResponse{
+		Candidates: []GeminiCandidate{
+			{
+				Content:      GeminiContent{Role: "model", Parts: []GeminiPart{{Text: "Hello"}}},
+				FinishReason: "STOP",
+			},
+		},
+	}
+
+	resp := translateGeminiToResponse(geminiResp, "gemini-2.5-flash", nil)
+
+	if resp.Metadata != nil {
+		t.Errorf("expected nil metadata when no request, got %v", resp.Metadata)
+	}
+}
+
 func TestTranslateResponsesToGeminiWithFrequencyPenalty(t *testing.T) {
 	fp := 0.5
 	pp := 0.3

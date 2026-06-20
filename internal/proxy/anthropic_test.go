@@ -508,6 +508,79 @@ func TestParseAnthropicContentImageURLSkipped(t *testing.T) {
 	}
 }
 
+func TestParseAnthropicContentAudioBase64(t *testing.T) {
+	content := AnthropicContent([]interface{}{
+		map[string]interface{}{
+			"type": "audio",
+			"source": map[string]interface{}{
+				"type":       "base64",
+				"media_type": "audio/wav",
+				"data":       "base64audiodata",
+			},
+		},
+	})
+	toolUseMap := map[string]string{}
+	parts := parseAnthropicContent(content, toolUseMap)
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+	if parts[0].InlineData == nil {
+		t.Fatal("expected InlineData")
+	}
+	if parts[0].InlineData.MimeType != "audio/wav" {
+		t.Errorf("expected mimeType 'audio/wav', got '%s'", parts[0].InlineData.MimeType)
+	}
+	if parts[0].InlineData.Data != "base64audiodata" {
+		t.Errorf("expected data 'base64audiodata', got '%s'", parts[0].InlineData.Data)
+	}
+}
+
+func TestParseAnthropicContentAudioURLSkipped(t *testing.T) {
+	content := AnthropicContent([]interface{}{
+		map[string]interface{}{
+			"type": "audio",
+			"source": map[string]interface{}{
+				"type": "url",
+				"url":  "https://example.com/audio.wav",
+			},
+		},
+	})
+	toolUseMap := map[string]string{}
+	parts := parseAnthropicContent(content, toolUseMap)
+	if len(parts) != 0 {
+		t.Errorf("expected 0 parts for URL audio (fetch failed), got %d", len(parts))
+	}
+}
+
+func TestParseAnthropicContentMixedWithAudio(t *testing.T) {
+	content := AnthropicContent([]interface{}{
+		map[string]interface{}{"type": "text", "text": "Listen to this"},
+		map[string]interface{}{
+			"type": "audio",
+			"source": map[string]interface{}{
+				"type":       "base64",
+				"media_type": "audio/mp3",
+				"data":       "mp3data",
+			},
+		},
+		map[string]interface{}{"type": "text", "text": "and describe it"},
+	})
+	toolUseMap := map[string]string{}
+	parts := parseAnthropicContent(content, toolUseMap)
+	if len(parts) != 3 {
+		t.Fatalf("expected 3 parts, got %d", len(parts))
+	}
+	if parts[0].Text != "Listen to this" {
+		t.Errorf("expected 'Listen to this', got '%s'", parts[0].Text)
+	}
+	if parts[1].InlineData == nil || parts[1].InlineData.MimeType != "audio/mp3" {
+		t.Errorf("expected audio/mp3 inline data")
+	}
+	if parts[2].Text != "and describe it" {
+		t.Errorf("expected 'and describe it', got '%s'", parts[2].Text)
+	}
+}
+
 func TestParseAnthropicContentMixedBlocks(t *testing.T) {
 	content := AnthropicContent([]interface{}{
 		map[string]interface{}{"type": "text", "text": "Hello"},

@@ -30,22 +30,23 @@ func NewResponsesHandler(baseURL string, pool *key.Pool) *ResponsesHandler {
 // Responses API Request Types
 
 type ResponsesRequest struct {
-	Model              string          `json:"model"`
-	Input              json.RawMessage `json:"input"`
-	Instructions       string          `json:"instructions,omitempty"`
-	Tools              []ResponseTool  `json:"tools,omitempty"`
-	ToolChoice         json.RawMessage `json:"tool_choice,omitempty"`
-	Temperature        *float64        `json:"temperature,omitempty"`
-	TopP               *float64        `json:"top_p,omitempty"`
-	MaxOutputTokens    *int            `json:"max_output_tokens,omitempty"`
-	Stream             bool            `json:"stream,omitempty"`
-	Store              *bool           `json:"store,omitempty"`
-	ParallelToolCalls  *bool           `json:"parallel_tool_calls,omitempty"`
-	PreviousResponseID string          `json:"previous_response_id,omitempty"`
-	Include            []string        `json:"include,omitempty"`
-	Text               *ResponseText   `json:"text,omitempty"`
-	FrequencyPenalty   *float64        `json:"frequency_penalty,omitempty"`
-	PresencePenalty    *float64        `json:"presence_penalty,omitempty"`
+	Model              string            `json:"model"`
+	Input              json.RawMessage   `json:"input"`
+	Instructions       string            `json:"instructions,omitempty"`
+	Tools              []ResponseTool    `json:"tools,omitempty"`
+	ToolChoice         json.RawMessage   `json:"tool_choice,omitempty"`
+	Temperature        *float64          `json:"temperature,omitempty"`
+	TopP               *float64          `json:"top_p,omitempty"`
+	MaxOutputTokens    *int              `json:"max_output_tokens,omitempty"`
+	Stream             bool              `json:"stream,omitempty"`
+	Store              *bool             `json:"store,omitempty"`
+	ParallelToolCalls  *bool             `json:"parallel_tool_calls,omitempty"`
+	PreviousResponseID string            `json:"previous_response_id,omitempty"`
+	Include            []string          `json:"include,omitempty"`
+	Text               *ResponseText     `json:"text,omitempty"`
+	FrequencyPenalty   *float64          `json:"frequency_penalty,omitempty"`
+	PresencePenalty    *float64          `json:"presence_penalty,omitempty"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
 }
 
 type ResponseText struct {
@@ -507,6 +508,10 @@ func translateGeminiToResponse(geminiResp *GeminiResponse, model string, req *Re
 		Store:             false,
 	}
 
+	if req != nil && len(req.Metadata) > 0 {
+		resp.Metadata = req.Metadata
+	}
+
 	// Handle empty candidates
 	if len(geminiResp.Candidates) == 0 {
 		resp.Status = "incomplete"
@@ -816,6 +821,9 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 		ParallelToolCalls: true,
 		Store:             false,
 	}
+	if len(req.Metadata) > 0 {
+		response.Metadata = req.Metadata
+	}
 
 	// Streaming event sequence for reasoning + function_call:
 	// 1. response.created
@@ -938,6 +946,7 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 	contentIndex := 0
 	itemStarted := false
 	reasoningStarted := false
+	reasoningCompleted := false
 	reasoningItemID := generateItemID("rs_")
 	itemID := generateItemID("msg_")
 	var usageMetadata *GeminiUsageMetadata
@@ -1047,10 +1056,58 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 				seqNum++
 				outputIndex++
 				reasoningStarted = false
+				reasoningCompleted = true
 			}
 
 			// Handle function calls
 			if part.FunctionCall != nil {
+				// Close any in-progress text item before starting function call
+				if itemStarted && currentText.Len() > 0 {
+					partDoneEvent := ResponseStreamEvent{
+						Type:         "response.content_part.done",
+						OutputIndex:  outputIndex,
+						ContentIndex: contentIndex,
+						ItemID:       itemID,
+						Part: ResponseMessageContent{
+							Type:        "output_text",
+							Text:        currentText.String(),
+							Annotations: json.RawMessage("[]"),
+						},
+						SequenceNumber: seqNum,
+					}
+					eventData, _ := json.Marshal(partDoneEvent)
+					w.Write([]byte("data: "))
+					w.Write(eventData)
+					w.Write([]byte("\n\n"))
+					flusher.Flush()
+					seqNum++
+
+					itemDoneEvent := ResponseStreamEvent{
+						Type:        "response.output_item.done",
+						OutputIndex: outputIndex,
+						Item: ResponseOutputItem{
+							Type:   "message",
+							ID:     itemID,
+							Status: "completed",
+							Role:   "assistant",
+							Content: mustMarshal([]ResponseMessageContent{{
+								Type:        "output_text",
+								Text:        currentText.String(),
+								Annotations: json.RawMessage("[]"),
+							}}),
+						},
+						SequenceNumber: seqNum,
+					}
+					eventData, _ = json.Marshal(itemDoneEvent)
+					w.Write([]byte("data: "))
+					w.Write(eventData)
+					w.Write([]byte("\n\n"))
+					flusher.Flush()
+					seqNum++
+					outputIndex++
+					itemStarted = false
+				}
+
 				fcItemID := generateItemID("fc_")
 				callID := generateItemID("call_")
 				if !itemStarted {
@@ -1239,6 +1296,7 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 				flusher.Flush()
 				seqNum++
 				outputIndex++
+				reasoningCompleted = true
 			}
 
 			// Close text block if open
@@ -1301,7 +1359,7 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 			}
 
 			var outputItems []ResponseOutputItem
-			if reasoningStarted {
+			if reasoningCompleted || reasoningStarted {
 				outputItems = append(outputItems, ResponseOutputItem{
 					Type:   "reasoning",
 					ID:     reasoningItemID,
@@ -1359,7 +1417,7 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 	var outputItems []ResponseOutputItem
-	if reasoningStarted {
+	if reasoningCompleted || reasoningStarted {
 		outputItems = append(outputItems, ResponseOutputItem{
 			Type:   "reasoning",
 			ID:     reasoningItemID,

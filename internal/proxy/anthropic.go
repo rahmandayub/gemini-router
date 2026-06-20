@@ -1084,38 +1084,70 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 							Thought: true,
 						})
 					}
-				case "image":
-					if source, ok := block["source"].(map[string]interface{}); ok {
-						sourceType, _ := source["type"].(string)
-						if sourceType == "base64" {
-							mediaType, _ := source["media_type"].(string)
-							data, _ := source["data"].(string)
-							if mediaType != "" && data != "" {
+			case "image":
+				if source, ok := block["source"].(map[string]interface{}); ok {
+					sourceType, _ := source["type"].(string)
+					if sourceType == "base64" {
+						mediaType, _ := source["media_type"].(string)
+						data, _ := source["data"].(string)
+						if mediaType != "" && data != "" {
+							parts = append(parts, GeminiPart{
+								InlineData: &GeminiInlineData{
+									MimeType: mediaType,
+									Data:     data,
+								},
+							})
+						}
+					} else if sourceType == "url" {
+						url, _ := source["url"].(string)
+						if url != "" {
+							if mimeType, data, err := fetchAndEncodeImage(url); err == nil {
 								parts = append(parts, GeminiPart{
 									InlineData: &GeminiInlineData{
-										MimeType: mediaType,
+										MimeType: mimeType,
 										Data:     data,
 									},
 								})
+							} else {
+								log.Printf("[proxy/anthropic] failed to fetch image URL %s: %v", url, err)
 							}
-						} else if sourceType == "url" {
-							url, _ := source["url"].(string)
-							if url != "" {
-								if mimeType, data, err := fetchAndEncodeImage(url); err == nil {
-									parts = append(parts, GeminiPart{
-										InlineData: &GeminiInlineData{
-											MimeType: mimeType,
-											Data:     data,
-										},
-									})
-								} else {
-									log.Printf("[proxy/anthropic] failed to fetch image URL %s: %v", url, err)
-								}
-							}
-						} else {
-							log.Printf("[proxy/anthropic] unsupported image source type: %s, skipping block", sourceType)
 						}
+					} else {
+						log.Printf("[proxy/anthropic] unsupported image source type: %s, skipping block", sourceType)
 					}
+				}
+			case "audio":
+				if source, ok := block["source"].(map[string]interface{}); ok {
+					sourceType, _ := source["type"].(string)
+					if sourceType == "base64" {
+						mediaType, _ := source["media_type"].(string)
+						data, _ := source["data"].(string)
+						if mediaType != "" && data != "" {
+							parts = append(parts, GeminiPart{
+								InlineData: &GeminiInlineData{
+									MimeType: mediaType,
+									Data:     data,
+								},
+							})
+						}
+					} else if sourceType == "url" {
+						url, _ := source["url"].(string)
+						if url != "" {
+							if mimeType, data, err := fetchAndEncodeImage(url); err == nil {
+								parts = append(parts, GeminiPart{
+									InlineData: &GeminiInlineData{
+										MimeType: mimeType,
+										Data:     data,
+									},
+								})
+							} else {
+								log.Printf("[proxy/anthropic] failed to fetch audio URL %s: %v", url, err)
+							}
+						}
+					} else {
+						log.Printf("[proxy/anthropic] unsupported audio source type: %s, skipping block", sourceType)
+					}
+				}
 				}
 			}
 		}
