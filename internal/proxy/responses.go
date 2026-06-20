@@ -985,6 +985,36 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 				continue
 			}
 
+			// When transitioning from reasoning to non-reasoning, close reasoning and advance outputIndex
+			if reasoningStarted {
+				reasoningDoneEvent := ResponseStreamEvent{
+					Type:        "response.output_item.done",
+					OutputIndex: outputIndex,
+					Item: ResponseOutputItem{
+						Type:   "reasoning",
+						ID:     reasoningItemID,
+						Status: "completed",
+						Summary: mustMarshal([]ResponseSummaryContent{{
+							Type: "summary_text",
+							Text: currentReasoning.String(),
+						}}),
+						Content: mustMarshal([]ResponseReasoningContent{{
+							Type: "reasoning_text",
+							Text: currentReasoning.String(),
+						}}),
+					},
+					SequenceNumber: seqNum,
+				}
+				eventData, _ := json.Marshal(reasoningDoneEvent)
+				w.Write([]byte("data: "))
+				w.Write(eventData)
+				w.Write([]byte("\n\n"))
+				flusher.Flush()
+				seqNum++
+				outputIndex++
+				reasoningStarted = false
+			}
+
 			// Handle function calls
 			if part.FunctionCall != nil {
 				fcItemID := generateItemID("fc_")

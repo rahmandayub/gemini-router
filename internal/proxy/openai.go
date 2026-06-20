@@ -44,6 +44,7 @@ type OpenAIRequest struct {
 	FrequencyPenalty *float64            `json:"frequency_penalty,omitempty"`
 	PresencePenalty  *float64            `json:"presence_penalty,omitempty"`
 	Seed             *int                `json:"seed,omitempty"`
+	ReasoningEffort  *string             `json:"reasoning_effort,omitempty"`
 }
 
 type OpenAIResponseFmt struct {
@@ -289,6 +290,7 @@ type GeminiGenerationConfig struct {
 	FrequencyPenalty *float64              `json:"frequencyPenalty,omitempty"`
 	PresencePenalty  *float64              `json:"presencePenalty,omitempty"`
 	Seed             *int                  `json:"seed,omitempty"`
+	CandidateCount   *int                  `json:"candidateCount,omitempty"`
 }
 
 type GeminiResponse struct {
@@ -552,7 +554,7 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer resp.Body.Close()
 
-		h.handleStreamResponse(w, resp, openAIReq.Model, id, created, true)
+		h.handleStreamResponse(w, resp, openAIReq.Model, id, created, true, openAIReq.StreamOptions)
 	} else {
 		// Non-stream flow (normal retry loop)
 		for attempt := 0; attempt < maxRetries; attempt++ {
@@ -640,7 +642,7 @@ func (h *OpenAIHandler) handleNonStreamResponse(w http.ResponseWriter, resp *htt
 	w.Write(respBody)
 }
 
-func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, id string, created int64, headersWritten bool) {
+func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, id string, created int64, headersWritten bool, streamOpts *OpenAIStreamOpts) {
 	log.Printf("[proxy/stream] handleStreamResponse called, status=%d", resp.StatusCode)
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -708,6 +710,7 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 	hasToolCall := false
 	isFirst := !headersWritten
 	globalToolCallIdx := 0
+	var lastUsageMetadata *GeminiUsageMetadata
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -799,22 +802,19 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 			continue
 		}
 
+		if geminiResp.UsageMetadata != nil {
+			lastUsageMetadata = geminiResp.UsageMetadata
+		}
+
 		if len(geminiResp.Candidates) == 0 {
 			continue
 		}
 
 		// Check if this chunk contains a tool call
 		candidate := geminiResp.Candidates[0]
-		localIdx := globalToolCallIdx
 		for _, part := range candidate.Content.Parts {
 			if part.FunctionCall != nil {
 				hasToolCall = true
-				if part.ThoughtSignature != "" {
-					toolCallID := fmt.Sprintf("%s%s_%s_%d", OpenAICallPrefix, part.FunctionCall.Name, id, localIdx)
-					thoughtSignatureCache.Store(toolCallID, part.ThoughtSignature)
-				log.Printf("[proxy/stream] Stored stream thought signature for tool call %s", toolCallID)
-				}
-				localIdx++
 			}
 		}
 
@@ -832,6 +832,18 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 						val := globalToolCallIdx
 						openAIChunk.Choices[i].Delta.ToolCalls[j].Index = &val
 						openAIChunk.Choices[i].Delta.ToolCalls[j].ID = fmt.Sprintf("%s_%s_%d", openAIChunk.Choices[i].Delta.ToolCalls[j].ID, id, val)
+
+						// Cache thought signature using the final tool call ID
+						for _, part := range candidate.Content.Parts {
+							if part.FunctionCall != nil && part.FunctionCall.Name == openAIChunk.Choices[i].Delta.ToolCalls[j].Function.Name {
+								if part.ThoughtSignature != "" {
+									thoughtSignatureCache.Store(openAIChunk.Choices[i].Delta.ToolCalls[j].ID, part.ThoughtSignature)
+									log.Printf("[proxy/stream] Stored stream thought signature for tool call %s", openAIChunk.Choices[i].Delta.ToolCalls[j].ID)
+								}
+								break
+							}
+						}
+
 						globalToolCallIdx++
 					}
 				}
@@ -854,6 +866,27 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 
 	if !sentAny {
 		log.Printf("[proxy/stream] warning: no chunks sent to client")
+	}
+
+	// Send usage chunk if stream_options.include_usage is true
+	if streamOpts != nil && streamOpts.IncludeUsage != nil && *streamOpts.IncludeUsage && lastUsageMetadata != nil {
+		usageChunk := OpenAIResponse{
+			ID:      id,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   model,
+			Choices: []OpenAIChoice{},
+			Usage: &OpenAIUsage{
+				PromptTokens:     lastUsageMetadata.PromptTokenCount,
+				CompletionTokens: lastUsageMetadata.CandidatesTokenCount,
+				TotalTokens:      lastUsageMetadata.TotalTokenCount,
+			},
+		}
+		chunkData, _ := json.Marshal(usageChunk)
+		w.Write([]byte("data: "))
+		w.Write(chunkData)
+		w.Write([]byte("\n\n"))
+		flusher.Flush()
 	}
 
 	w.Write([]byte("data: [DONE]\n\n"))
@@ -1032,8 +1065,21 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 	if req.Seed != nil {
 		genConfig.Seed = req.Seed
 	}
+	if req.N != nil && *req.N > 0 {
+		genConfig.CandidateCount = req.N
+	}
 
-	if genConfig.Temperature != nil || genConfig.TopP != nil || genConfig.MaxOutputTokens != nil || genConfig.ResponseMimeType != "" || len(genConfig.StopSequences) > 0 || genConfig.FrequencyPenalty != nil || genConfig.PresencePenalty != nil || genConfig.Seed != nil {
+	if req.ReasoningEffort != nil && !strings.Contains(strings.ToLower(req.Model), "gemma") {
+		budget := reasoningEffortToBudget(*req.ReasoningEffort)
+		genConfig.ThinkingConfig = &GeminiThinkingConfig{
+			ThinkingBudget: budget,
+		}
+		if budget > 0 && genConfig.MaxOutputTokens == nil {
+			genConfig.MaxOutputTokens = &budget
+		}
+	}
+
+	if genConfig.Temperature != nil || genConfig.TopP != nil || genConfig.MaxOutputTokens != nil || genConfig.ResponseMimeType != "" || len(genConfig.StopSequences) > 0 || genConfig.FrequencyPenalty != nil || genConfig.PresencePenalty != nil || genConfig.Seed != nil || genConfig.ThinkingConfig != nil || genConfig.CandidateCount != nil {
 		geminiReq.GenerationConfig = genConfig
 	}
 
@@ -1041,10 +1087,9 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 }
 
 var unsupportedSchemaProps = map[string]bool{
-	"$comment":             true,
-	"$schema":              true,
-	"additionalProperties": true,
-	"enumDescriptions":     true,
+	"$comment":         true,
+	"$schema":          true,
+	"enumDescriptions": true,
 }
 
 func cleanSchema(raw json.RawMessage) (json.RawMessage, error) {
@@ -1070,6 +1115,23 @@ func cleanNode(node interface{}) {
 		for _, item := range v {
 			cleanNode(item)
 		}
+	}
+}
+
+func reasoningEffortToBudget(effort string) int {
+	switch strings.ToLower(effort) {
+	case "high", "xhigh":
+		return 8192
+	case "medium":
+		return 2048
+	case "low":
+		return 512
+	case "minimal":
+		return 128
+	case "none":
+		return 0
+	default:
+		return 2048
 	}
 }
 

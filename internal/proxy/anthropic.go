@@ -1110,6 +1110,20 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 									},
 								})
 							}
+						} else if sourceType == "url" {
+							url, _ := source["url"].(string)
+							if url != "" {
+								if mimeType, data, err := fetchAndEncodeImage(url); err == nil {
+									parts = append(parts, GeminiPart{
+										InlineData: &GeminiInlineData{
+											MimeType: mimeType,
+											Data:     data,
+										},
+									})
+								} else {
+									log.Printf("[proxy/anthropic] failed to fetch image URL %s: %v", url, err)
+								}
+							}
 						} else {
 							log.Printf("[proxy/anthropic] unsupported image source type: %s, skipping block", sourceType)
 						}

@@ -757,10 +757,122 @@ func TestCleanSchemaStripsUnsupportedProps(t *testing.T) {
 	if _, ok := result["$comment"]; ok {
 		t.Error("expected $comment to be stripped")
 	}
-	if _, ok := result["additionalProperties"]; ok {
-		t.Error("expected additionalProperties to be stripped")
+	if _, ok := result["additionalProperties"]; !ok {
+		t.Error("expected additionalProperties to be preserved")
 	}
 	if _, ok := result["properties"]; !ok {
 		t.Error("expected properties to be preserved")
+	}
+}
+
+func TestTranslateToGeminiReasoningEffort(t *testing.T) {
+	tests := []struct {
+		effort        string
+		expectedBudget int
+	}{
+		{"high", 8192},
+		{"medium", 2048},
+		{"low", 512},
+		{"minimal", 128},
+		{"none", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.effort, func(t *testing.T) {
+			effort := tt.effort
+			req := &OpenAIRequest{
+				Model: "gemini-2.5-flash",
+				Messages: []OpenAIMessage{
+					{Role: "user", Content: rawMsg("Hello")},
+				},
+				ReasoningEffort: &effort,
+			}
+
+			geminiReq, err := translateToGemini(req)
+			if err != nil {
+				t.Fatalf("translateToGemini failed: %v", err)
+			}
+
+			if geminiReq.GenerationConfig == nil {
+				t.Fatal("expected generation config")
+			}
+			if geminiReq.GenerationConfig.ThinkingConfig == nil {
+				t.Fatal("expected thinking config")
+			}
+			if geminiReq.GenerationConfig.ThinkingConfig.ThinkingBudget != tt.expectedBudget {
+				t.Errorf("expected thinking budget %d, got %d", tt.expectedBudget, geminiReq.GenerationConfig.ThinkingConfig.ThinkingBudget)
+			}
+		})
+	}
+}
+
+func TestTranslateToGeminiReasoningEffortGemmaSkipped(t *testing.T) {
+	effort := "high"
+	req := &OpenAIRequest{
+		Model: "gemma-4-31b-it",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: rawMsg("Hello")},
+		},
+		ReasoningEffort: &effort,
+	}
+
+	geminiReq, err := translateToGemini(req)
+	if err != nil {
+		t.Fatalf("translateToGemini failed: %v", err)
+	}
+
+	if geminiReq.GenerationConfig != nil && geminiReq.GenerationConfig.ThinkingConfig != nil {
+		t.Error("expected no thinking config for gemma model")
+	}
+}
+
+func TestTranslateToGeminiCandidateCount(t *testing.T) {
+	n := 3
+	req := &OpenAIRequest{
+		Model: "gemini-2.5-flash",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: rawMsg("Hello")},
+		},
+		N: &n,
+	}
+
+	geminiReq, err := translateToGemini(req)
+	if err != nil {
+		t.Fatalf("translateToGemini failed: %v", err)
+	}
+
+	if geminiReq.GenerationConfig == nil {
+		t.Fatal("expected generation config")
+	}
+	if geminiReq.GenerationConfig.CandidateCount == nil {
+		t.Fatal("expected candidateCount")
+	}
+	if *geminiReq.GenerationConfig.CandidateCount != 3 {
+		t.Errorf("expected candidateCount 3, got %d", *geminiReq.GenerationConfig.CandidateCount)
+	}
+}
+
+func TestReasoningEffortToBudget(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected int
+	}{
+		{"high", 8192},
+		{"xhigh", 8192},
+		{"medium", 2048},
+		{"low", 512},
+		{"minimal", 128},
+		{"none", 0},
+		{"unknown", 2048},
+		{"", 2048},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := reasoningEffortToBudget(tt.input)
+			if result != tt.expected {
+				t.Errorf("reasoningEffortToBudget(%q) = %d, want %d", tt.input, result, tt.expected)
+			}
+		})
 	}
 }
