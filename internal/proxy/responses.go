@@ -44,6 +44,8 @@ type ResponsesRequest struct {
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
 	Include            []string        `json:"include,omitempty"`
 	Text               *ResponseText   `json:"text,omitempty"`
+	FrequencyPenalty   *float64        `json:"frequency_penalty,omitempty"`
+	PresencePenalty    *float64        `json:"presence_penalty,omitempty"`
 }
 
 type ResponseText struct {
@@ -305,6 +307,12 @@ func translateResponsesToGemini(req *ResponsesRequest) (*GeminiRequest, error) {
 	if req.MaxOutputTokens != nil {
 		genConfig.MaxOutputTokens = req.MaxOutputTokens
 	}
+	if req.FrequencyPenalty != nil {
+		genConfig.FrequencyPenalty = req.FrequencyPenalty
+	}
+	if req.PresencePenalty != nil {
+		genConfig.PresencePenalty = req.PresencePenalty
+	}
 
 	// Handle text format (structured output)
 	if req.Text != nil && req.Text.Format != nil {
@@ -324,7 +332,7 @@ func translateResponsesToGemini(req *ResponsesRequest) (*GeminiRequest, error) {
 		}
 	}
 
-	if genConfig.Temperature != nil || genConfig.TopP != nil || genConfig.MaxOutputTokens != nil || genConfig.ResponseMimeType != "" {
+	if genConfig.Temperature != nil || genConfig.TopP != nil || genConfig.MaxOutputTokens != nil || genConfig.ResponseMimeType != "" || genConfig.FrequencyPenalty != nil || genConfig.PresencePenalty != nil {
 		geminiReq.GenerationConfig = genConfig
 	}
 
@@ -391,7 +399,18 @@ func translateInputItemToContent(item ResponseInputItem) (*GeminiContent, error)
 			geminiRole = "model"
 		}
 
-		// Extract text content
+		// Extract Gemini parts (text + images) from content
+		if len(item.Content) > 0 {
+			parts := extractGeminiPartsFromContent(item.Content)
+			if len(parts) > 0 {
+				return &GeminiContent{
+					Role:  geminiRole,
+					Parts: parts,
+				}, nil
+			}
+		}
+
+		// Fallback: extract text only
 		text := extractTextFromContent(item.Content)
 		if text == "" {
 			return nil, nil

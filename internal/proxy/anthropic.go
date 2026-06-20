@@ -917,21 +917,8 @@ func translateAnthropicToGemini(req *AnthropicRequest) (*GeminiRequest, error) {
 		case "user":
 			content := parseAnthropicContent(msg.Content, toolUseIDToName)
 			if len(content) > 0 {
-				hasFuncResponse := false
-				for _, p := range content {
-					if p.FunctionResponse != nil {
-						hasFuncResponse = true
-						break
-					}
-				}
-
-				role := "user"
-				if hasFuncResponse {
-					role = "function"
-				}
-
 				contents = append(contents, GeminiContent{
-					Role:  role,
+					Role:  "user",
 					Parts: content,
 				})
 			}

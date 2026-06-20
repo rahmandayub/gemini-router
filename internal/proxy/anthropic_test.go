@@ -738,6 +738,54 @@ func TestTranslateAnthropicToGeminiGemmaNoThinking(t *testing.T) {
 	}
 }
 
+func TestTranslateAnthropicToGeminiToolResultRoleIsUser(t *testing.T) {
+	req := &AnthropicRequest{
+		Model: "gemini-2.5-flash",
+		Messages: []AnthropicMessage{
+			{Role: "user", Content: AnthropicContent("What is the weather?")},
+			{Role: "assistant", Content: AnthropicContent([]interface{}{
+				map[string]interface{}{
+					"type":  "tool_use",
+					"id":    "toolu_abc",
+					"name":  "get_weather",
+					"input": map[string]interface{}{"location": "NYC"},
+				},
+			})},
+			{Role: "user", Content: AnthropicContent([]interface{}{
+				map[string]interface{}{
+					"type":        "tool_result",
+					"tool_use_id": "toolu_abc",
+					"content":     `{"temp": 72}`,
+				},
+			})},
+		},
+		MaxTokens: 1024,
+	}
+
+	geminiReq, err := translateAnthropicToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Find the content block with the function response
+	foundFuncResponse := false
+	for _, c := range geminiReq.Contents {
+		for _, p := range c.Parts {
+			if p.FunctionResponse != nil {
+				foundFuncResponse = true
+				// Verify the role is "user", not "function"
+				if c.Role != "user" {
+					t.Errorf("expected role 'user' for function response content, got '%s'", c.Role)
+				}
+			}
+		}
+	}
+
+	if !foundFuncResponse {
+		t.Fatal("expected to find a function response in contents")
+	}
+}
+
 func intPtr(i int) *int {
 	return &i
 }

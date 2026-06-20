@@ -159,6 +159,10 @@ func extractGeminiPartsFromContent(raw json.RawMessage) []GeminiPart {
 					}
 				}
 			}
+		case "audio", "video", "document", "file":
+			log.Printf("[proxy/openai] unsupported content type '%s' dropped (only text and image_url are supported)", p.Type)
+		default:
+			log.Printf("[proxy/openai] unknown content type '%s' dropped", p.Type)
 		}
 	}
 	return geminiParts

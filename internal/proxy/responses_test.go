@@ -885,4 +885,97 @@ func TestExtractTextFromJSONRawMessageArray(t *testing.T) {
 	}
 }
 
+func TestTranslateResponsesToGeminiWithFrequencyPenalty(t *testing.T) {
+	fp := 0.5
+	pp := 0.3
+	req := &ResponsesRequest{
+		Model:            "gemini-2.5-flash",
+		Input:            json.RawMessage(`"test"`),
+		FrequencyPenalty: &fp,
+		PresencePenalty:  &pp,
+	}
+
+	geminiReq, err := translateResponsesToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if geminiReq.GenerationConfig == nil {
+		t.Fatal("expected generation config")
+	}
+	if geminiReq.GenerationConfig.FrequencyPenalty == nil {
+		t.Fatal("expected frequency_penalty")
+	}
+	if *geminiReq.GenerationConfig.FrequencyPenalty != 0.5 {
+		t.Errorf("expected frequency_penalty 0.5, got %f", *geminiReq.GenerationConfig.FrequencyPenalty)
+	}
+	if geminiReq.GenerationConfig.PresencePenalty == nil {
+		t.Fatal("expected presence_penalty")
+	}
+	if *geminiReq.GenerationConfig.PresencePenalty != 0.3 {
+		t.Errorf("expected presence_penalty 0.3, got %f", *geminiReq.GenerationConfig.PresencePenalty)
+	}
+}
+
+func TestTranslateResponsesToGeminiWithImageContent(t *testing.T) {
+	input := json.RawMessage(`[{"role":"user","content":[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}]}]`)
+	req := &ResponsesRequest{
+		Model: "gemini-2.5-flash",
+		Input: input,
+	}
+
+	geminiReq, err := translateResponsesToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(geminiReq.Contents) != 1 {
+		t.Fatalf("expected 1 content, got %d", len(geminiReq.Contents))
+	}
+
+	parts := geminiReq.Contents[0].Parts
+	if len(parts) != 2 {
+		t.Fatalf("expected 2 parts, got %d", len(parts))
+	}
+	if parts[0].Text != "What is this?" {
+		t.Errorf("expected text 'What is this?', got '%s'", parts[0].Text)
+	}
+	if parts[1].InlineData == nil {
+		t.Fatal("expected inlineData for image")
+	}
+	if parts[1].InlineData.MimeType != "image/png" {
+		t.Errorf("expected mimeType 'image/png', got '%s'", parts[1].InlineData.MimeType)
+	}
+	if parts[1].InlineData.Data != "abc123" {
+		t.Errorf("expected data 'abc123', got '%s'", parts[1].InlineData.Data)
+	}
+}
+
+func TestTranslateResponsesToGeminiWithImageOnlyContent(t *testing.T) {
+	input := json.RawMessage(`[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/abc"}}]}]`)
+	req := &ResponsesRequest{
+		Model: "gemini-2.5-flash",
+		Input: input,
+	}
+
+	geminiReq, err := translateResponsesToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(geminiReq.Contents) != 1 {
+		t.Fatalf("expected 1 content, got %d", len(geminiReq.Contents))
+	}
+
+	parts := geminiReq.Contents[0].Parts
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+	if parts[0].InlineData == nil {
+		t.Fatal("expected inlineData for image")
+	}
+	if parts[0].InlineData.MimeType != "image/jpeg" {
+		t.Errorf("expected mimeType 'image/jpeg', got '%s'", parts[0].InlineData.MimeType)
+	}
+}
 
