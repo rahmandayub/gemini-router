@@ -246,7 +246,7 @@ func fetchAndEncodeImage(url string) (mimeType string, base64Data string, err er
 
 type OpenAIDelta struct {
 	Role             string           `json:"role,omitempty"`
-	Content          string           `json:"content"`
+	Content          string           `json:"content,omitempty"`
 	ReasoningContent string           `json:"reasoning_content,omitempty"`
 	ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
 }
@@ -379,7 +379,7 @@ type OpenAIChoice struct {
 	Index        int            `json:"index"`
 	Message      *OpenAIMessage `json:"message,omitempty"`
 	Delta        *OpenAIDelta   `json:"delta,omitempty"`
-	FinishReason *string        `json:"finish_reason"`
+	FinishReason *string        `json:"finish_reason,omitempty"`
 }
 
 type OpenAIUsage struct {
@@ -1257,6 +1257,9 @@ func translateFromGemini(resp *GeminiResponse, model string, id string, created 
 		}
 		if len(reasoningParts) > 0 {
 			msg.ReasoningContent = strings.Join(reasoningParts, "")
+			if len(textParts) == 0 {
+				msg.Content = json.RawMessage(`""`)
+			}
 		}
 		if len(toolCalls) > 0 {
 			msg.ToolCalls = toolCalls

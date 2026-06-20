@@ -492,6 +492,33 @@ func TestTranslateFromGeminiEmptyCandidates(t *testing.T) {
 	}
 }
 
+func TestTranslateFromGeminiReasoningOnly(t *testing.T) {
+	resp := &GeminiResponse{
+		Candidates: []GeminiCandidate{
+			{
+				Content: GeminiContent{
+					Role: "model",
+					Parts: []GeminiPart{
+						{Text: "internal reasoning process", Thought: true},
+					},
+				},
+				FinishReason: "STOP",
+			},
+		},
+	}
+
+	opt := translateFromGemini(resp, "gemini-2.5-flash", "chatcmpl-test", 1234567890)
+
+	if opt.Choices[0].Message.ReasoningContent != "internal reasoning process" {
+		t.Errorf("expected reasoning content, got '%s'", opt.Choices[0].Message.ReasoningContent)
+	}
+
+	contentStr := string(opt.Choices[0].Message.Content)
+	if contentStr != `""` {
+		t.Errorf("expected Content to be empty string JSON, got '%s'", contentStr)
+	}
+}
+
 func TestTranslateFromGeminiToolCalls(t *testing.T) {
 	resp := &GeminiResponse{
 		Candidates: []GeminiCandidate{

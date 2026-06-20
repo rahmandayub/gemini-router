@@ -252,8 +252,40 @@ func TestTranslateFromGeminiToAnthropicEmptyCandidates(t *testing.T) {
 	if len(anthropicResp.Content) != 0 {
 		t.Errorf("expected 0 content blocks, got %d", len(anthropicResp.Content))
 	}
+	if anthropicResp.Content == nil {
+		t.Error("expected Content to be non-nil empty slice, not nil")
+	}
 	if anthropicResp.StopReason != "" {
 		t.Errorf("expected empty stop_reason, got '%s'", anthropicResp.StopReason)
+	}
+	if anthropicResp.Usage == nil {
+		t.Fatal("expected Usage to be set, got nil")
+	}
+}
+
+func TestTranslateFromGeminiToAnthropicEmptyParts(t *testing.T) {
+	resp := &GeminiResponse{
+		Candidates: []GeminiCandidate{
+			{
+				Content:      GeminiContent{Role: "model", Parts: []GeminiPart{}},
+				FinishReason: "STOP",
+			},
+		},
+	}
+
+	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test", false)
+
+	if anthropicResp.Content == nil {
+		t.Error("expected Content to be non-nil empty slice, got nil")
+	}
+	if len(anthropicResp.Content) != 0 {
+		t.Errorf("expected 0 content blocks, got %d", len(anthropicResp.Content))
+	}
+	if anthropicResp.Usage == nil {
+		t.Error("expected Usage to be set")
+	}
+	if anthropicResp.StopReason != "end_turn" {
+		t.Errorf("expected stop_reason 'end_turn', got '%s'", anthropicResp.StopReason)
 	}
 }
 

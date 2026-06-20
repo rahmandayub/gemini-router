@@ -1143,6 +1143,10 @@ func translateFromGeminiToAnthropic(resp *GeminiResponse, model string, msgID st
 	}
 
 	if len(resp.Candidates) == 0 {
+		anthropicResp.Usage = &AnthropicUsage{
+			InputTokens:  0,
+			OutputTokens: 0,
+		}
 		return anthropicResp
 	}
 
@@ -1152,7 +1156,7 @@ func translateFromGeminiToAnthropic(resp *GeminiResponse, model string, msgID st
 	anthropicResp.StopReason = mapGeminiFinishReasonToAnthropic(candidate.FinishReason)
 
 	// Process content parts
-	var contentBlocks []AnthropicRespBlock
+	contentBlocks := make([]AnthropicRespBlock, 0)
 	for _, part := range candidate.Content.Parts {
 		if part.Text != "" {
 			if part.Thought {
