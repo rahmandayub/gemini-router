@@ -241,6 +241,15 @@ func translateResponsesToGemini(req *ResponsesRequest) (*GeminiRequest, error) {
 			Parts: []GeminiPart{{Text: inputStr}},
 		})
 	} else {
+		// Build call_id -> function_name map from function_call items
+		// so function_call_output items without a name field can be resolved
+		callNameMap := make(map[string]string)
+		for _, item := range inputItems {
+			if item.Type == "function_call" && item.Name != "" {
+				callNameMap[item.CallID] = item.Name
+			}
+		}
+
 		// Array of items
 		for _, item := range inputItems {
 			// Handle developer/system role items by extracting text into systemInstruction
@@ -257,7 +266,7 @@ func translateResponsesToGemini(req *ResponsesRequest) (*GeminiRequest, error) {
 				}
 				continue
 			}
-			content, err := translateInputItemToContent(item)
+			content, err := translateInputItemToContent(item, callNameMap)
 			if err != nil {
 				return nil, fmt.Errorf("failed to translate input item: %w", err)
 			}
@@ -341,7 +350,8 @@ func translateResponsesToGemini(req *ResponsesRequest) (*GeminiRequest, error) {
 }
 
 // translateInputItemToContent translates a single input item to Gemini content
-func translateInputItemToContent(item ResponseInputItem) (*GeminiContent, error) {
+// callNameMap maps call_id to function name for resolving function_call_output items
+func translateInputItemToContent(item ResponseInputItem, callNameMap map[string]string) (*GeminiContent, error) {
 	switch item.Type {
 	case "function_call":
 		var args json.RawMessage
@@ -359,9 +369,14 @@ func translateInputItemToContent(item ResponseInputItem) (*GeminiContent, error)
 		}, nil
 
 	case "function_call_output":
-		// Function call output needs name field
-		if item.Name == "" {
-			return nil, fmt.Errorf("function_call_output requires 'name' field")
+		// Name is optional per OpenAI spec. Derive from call_id map or use call_id as fallback.
+		name := item.Name
+		if name == "" {
+			if mapped, ok := callNameMap[item.CallID]; ok {
+				name = mapped
+			} else {
+				name = item.CallID
+			}
 		}
 
 		// Parse output as JSON
@@ -374,7 +389,7 @@ func translateInputItemToContent(item ResponseInputItem) (*GeminiContent, error)
 			Role: "user",
 			Parts: []GeminiPart{{
 				FunctionResponse: &GeminiFuncResponse{
-					Name:     item.Name,
+					Name:     name,
 					Response: output,
 				},
 			}},
@@ -447,7 +462,7 @@ func extractTextFromContent(content interface{}) string {
 		if err := json.Unmarshal(v, &parts); err == nil {
 			var texts []string
 			for _, p := range parts {
-				if p.Type == "text" && p.Text != "" {
+				if (p.Type == "text" || p.Type == "input_text" || p.Type == "output_text" || p.Type == "refusal") && p.Text != "" {
 					texts = append(texts, p.Text)
 				}
 			}

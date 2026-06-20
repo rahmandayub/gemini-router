@@ -95,7 +95,7 @@ func parseOpenAIContent(raw json.RawMessage) string {
 	if err := json.Unmarshal(raw, &parts); err == nil {
 		var texts []string
 		for _, p := range parts {
-			if p.Type == "text" && p.Text != "" {
+			if (p.Type == "text" || p.Type == "input_text" || p.Type == "output_text" || p.Type == "refusal") && p.Text != "" {
 				texts = append(texts, p.Text)
 			}
 		}
@@ -131,7 +131,7 @@ func extractGeminiPartsFromContent(raw json.RawMessage) []GeminiPart {
 	var geminiParts []GeminiPart
 	for _, p := range parts {
 		switch p.Type {
-		case "text":
+		case "text", "input_text", "output_text", "refusal":
 			if p.Text != "" {
 				geminiParts = append(geminiParts, GeminiPart{Text: p.Text})
 			}

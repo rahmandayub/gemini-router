@@ -473,7 +473,7 @@ func TestTranslateInputItemToContentFunctionOutput(t *testing.T) {
 		Output: `{"temp": 72}`,
 	}
 
-	content, err := translateInputItemToContent(item)
+	content, err := translateInputItemToContent(item, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -498,9 +498,35 @@ func TestTranslateInputItemToContentFunctionOutputMissingName(t *testing.T) {
 		Output: `{"temp": 72}`,
 	}
 
-	_, err := translateInputItemToContent(item)
-	if err == nil {
-		t.Fatal("expected error for missing name")
+	content, err := translateInputItemToContent(item, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if content == nil {
+		t.Fatal("expected content")
+	}
+	if content.Parts[0].FunctionResponse.Name != "call_123" {
+		t.Errorf("expected fallback name 'call_123', got '%s'", content.Parts[0].FunctionResponse.Name)
+	}
+}
+
+func TestTranslateInputItemToContentFunctionOutputMissingNameWithCallMap(t *testing.T) {
+	item := ResponseInputItem{
+		Type:   "function_call_output",
+		CallID: "call_abc",
+		Output: `{"temp": 72}`,
+	}
+
+	callNameMap := map[string]string{"call_abc": "get_weather"}
+	content, err := translateInputItemToContent(item, callNameMap)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if content == nil {
+		t.Fatal("expected content")
+	}
+	if content.Parts[0].FunctionResponse.Name != "get_weather" {
+		t.Errorf("expected resolved name 'get_weather', got '%s'", content.Parts[0].FunctionResponse.Name)
 	}
 }
 
@@ -510,7 +536,7 @@ func TestTranslateInputItemToContentReasoning(t *testing.T) {
 		ID:   "rs_123",
 	}
 
-	content, err := translateInputItemToContent(item)
+	content, err := translateInputItemToContent(item, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -531,7 +557,7 @@ func TestTranslateInputItemToContentFunctionCall(t *testing.T) {
 		Arguments: `{"location":"NYC"}`,
 	}
 
-	content, err := translateInputItemToContent(item)
+	content, err := translateInputItemToContent(item, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -558,7 +584,7 @@ func TestTranslateInputItemToContentFunctionCallEmptyArgs(t *testing.T) {
 		Name: "do_something",
 	}
 
-	content, err := translateInputItemToContent(item)
+	content, err := translateInputItemToContent(item, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -577,7 +603,7 @@ func TestTranslateInputItemToContentDeveloperRole(t *testing.T) {
 		Content: json.RawMessage(`"You are helpful"`),
 	}
 
-	content, err := translateInputItemToContent(item)
+	content, err := translateInputItemToContent(item, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -624,7 +650,7 @@ func TestTranslateInputItemToContentDefaultRole(t *testing.T) {
 		Content: json.RawMessage(`"Hello"`),
 	}
 
-	content, err := translateInputItemToContent(item)
+	content, err := translateInputItemToContent(item, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
