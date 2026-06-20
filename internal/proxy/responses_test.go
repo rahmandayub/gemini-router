@@ -522,3 +522,337 @@ func TestTranslateInputItemToContentReasoning(t *testing.T) {
 func float64Ptr(f float64) *float64 {
 	return &f
 }
+
+func TestTranslateInputItemToContentFunctionCall(t *testing.T) {
+	item := ResponseInputItem{
+		Type:      "function_call",
+		CallID:    "call_abc",
+		Name:      "get_weather",
+		Arguments: `{"location":"NYC"}`,
+	}
+
+	content, err := translateInputItemToContent(item)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if content == nil {
+		t.Fatal("expected content")
+	}
+	if content.Role != "model" {
+		t.Errorf("expected role 'model', got '%s'", content.Role)
+	}
+	if content.Parts[0].FunctionCall == nil {
+		t.Fatal("expected FunctionCall")
+	}
+	if content.Parts[0].FunctionCall.Name != "get_weather" {
+		t.Errorf("expected 'get_weather', got '%s'", content.Parts[0].FunctionCall.Name)
+	}
+	if string(content.Parts[0].FunctionCall.Args) != `{"location":"NYC"}` {
+		t.Errorf("expected args, got '%s'", string(content.Parts[0].FunctionCall.Args))
+	}
+}
+
+func TestTranslateInputItemToContentFunctionCallEmptyArgs(t *testing.T) {
+	item := ResponseInputItem{
+		Type: "function_call",
+		Name: "do_something",
+	}
+
+	content, err := translateInputItemToContent(item)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if content == nil {
+		t.Fatal("expected content")
+	}
+	if content.Parts[0].FunctionCall.Args != nil {
+		t.Errorf("expected nil args, got '%s'", string(content.Parts[0].FunctionCall.Args))
+	}
+}
+
+func TestTranslateInputItemToContentDeveloperRole(t *testing.T) {
+	item := ResponseInputItem{
+		Type:    "",
+		Role:    "developer",
+		Content: json.RawMessage(`"You are helpful"`),
+	}
+
+	content, err := translateInputItemToContent(item)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if content == nil {
+		t.Fatal("expected content")
+	}
+	if content.Role != "user" {
+		t.Errorf("expected role 'user' (developer mapped to user for Gemini), got '%s'", content.Role)
+	}
+}
+
+func TestTranslateInputItemToContentDefaultRole(t *testing.T) {
+	item := ResponseInputItem{
+		Content: json.RawMessage(`"Hello"`),
+	}
+
+	content, err := translateInputItemToContent(item)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if content == nil {
+		t.Fatal("expected content")
+	}
+	if content.Role != "user" {
+		t.Errorf("expected role 'user', got '%s'", content.Role)
+	}
+}
+
+func TestTranslateResponsesToGeminiCleanSchema(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "gemini-2.5-flash",
+		Input: json.RawMessage(`"test"`),
+		Tools: []ResponseTool{
+			{
+				Type:       "function",
+				Name:       "test_fn",
+				Parameters: json.RawMessage(`{"type":"object","additionalProperties":false,"$schema":"http://json-schema.org/draft-07/schema#","properties":{"x":{"type":"string"}}}`),
+			},
+		},
+	}
+
+	geminiReq, err := translateResponsesToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var params map[string]interface{}
+	json.Unmarshal(geminiReq.Tools[0].FunctionDeclarations[0].Parameters, &params)
+
+	if _, ok := params["additionalProperties"]; ok {
+		t.Error("expected additionalProperties to be stripped")
+	}
+	if _, ok := params["$schema"]; ok {
+		t.Error("expected $schema to be stripped")
+	}
+	if _, ok := params["properties"]; !ok {
+		t.Error("expected properties to be preserved")
+	}
+}
+
+func TestMapFinishReasonBlocklist(t *testing.T) {
+	status, incomplete := mapFinishReason("BLOCKLIST")
+	if status != "incomplete" {
+		t.Errorf("expected 'incomplete', got '%s'", status)
+	}
+	if incomplete == nil || incomplete.Reason != "content_filter" {
+		t.Errorf("expected content_filter, got %v", incomplete)
+	}
+}
+
+func TestMapFinishReasonMalformedFunctionCall(t *testing.T) {
+	status, incomplete := mapFinishReason("MALFORMED_FUNCTION_CALL")
+	if status != "failed" {
+		t.Errorf("expected 'failed', got '%s'", status)
+	}
+	if incomplete == nil || incomplete.Reason != "tool_call_error" {
+		t.Errorf("expected tool_call_error, got %v", incomplete)
+	}
+}
+
+func TestTranslateGeminiToResponseWithFunctionCallAndMessage(t *testing.T) {
+	geminiResp := &GeminiResponse{
+		Candidates: []GeminiCandidate{
+			{
+				Content: GeminiContent{
+					Role: "model",
+					Parts: []GeminiPart{
+						{
+							FunctionCall: &GeminiFuncCall{
+								Name: "search",
+								Args: json.RawMessage(`{"q":"test"}`),
+							},
+						},
+						{Text: "Here are the results."},
+					},
+				},
+				FinishReason: "STOP",
+			},
+		},
+	}
+
+	resp := translateGeminiToResponse(geminiResp, "gemini-2.5-flash", nil)
+
+	if len(resp.Output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(resp.Output))
+	}
+	if resp.Output[0].Type != "function_call" {
+		t.Errorf("expected first item 'function_call', got '%s'", resp.Output[0].Type)
+	}
+	if resp.Output[1].Type != "message" {
+		t.Errorf("expected second item 'message', got '%s'", resp.Output[1].Type)
+	}
+}
+
+func TestTranslateResponsesToGeminiToolChoiceNone(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "gemini-2.5-flash",
+		Input: json.RawMessage(`"test"`),
+		Tools: []ResponseTool{
+			{Type: "function", Name: "fn", Parameters: json.RawMessage(`{"type":"object"}`)},
+		},
+		ToolChoice: json.RawMessage(`"none"`),
+	}
+
+	geminiReq, err := translateResponsesToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if geminiReq.ToolConfig == nil {
+		t.Fatal("expected tool config")
+	}
+	if geminiReq.ToolConfig.FunctionCallingConfig.Mode != "NONE" {
+		t.Errorf("expected NONE, got %s", geminiReq.ToolConfig.FunctionCallingConfig.Mode)
+	}
+}
+
+func TestTranslateResponsesToGeminiToolChoiceRequired(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "gemini-2.5-flash",
+		Input: json.RawMessage(`"test"`),
+		Tools: []ResponseTool{
+			{Type: "function", Name: "fn", Parameters: json.RawMessage(`{"type":"object"}`)},
+		},
+		ToolChoice: json.RawMessage(`"required"`),
+	}
+
+	geminiReq, err := translateResponsesToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if geminiReq.ToolConfig == nil {
+		t.Fatal("expected tool config")
+	}
+	if geminiReq.ToolConfig.FunctionCallingConfig.Mode != "ANY" {
+		t.Errorf("expected ANY, got %s", geminiReq.ToolConfig.FunctionCallingConfig.Mode)
+	}
+}
+
+func TestTranslateResponsesToGeminiToolChoiceFunction(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "gemini-2.5-flash",
+		Input: json.RawMessage(`"test"`),
+		Tools: []ResponseTool{
+			{Type: "function", Name: "get_weather", Parameters: json.RawMessage(`{"type":"object"}`)},
+		},
+		ToolChoice: json.RawMessage(`{"type":"function","name":"get_weather"}`),
+	}
+
+	geminiReq, err := translateResponsesToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if geminiReq.ToolConfig == nil {
+		t.Fatal("expected tool config")
+	}
+	if geminiReq.ToolConfig.FunctionCallingConfig.Mode != "ANY" {
+		t.Errorf("expected ANY, got %s", geminiReq.ToolConfig.FunctionCallingConfig.Mode)
+	}
+	if len(geminiReq.ToolConfig.FunctionCallingConfig.AllowedFunctionNames) != 1 {
+		t.Fatalf("expected 1 allowed name, got %d", len(geminiReq.ToolConfig.FunctionCallingConfig.AllowedFunctionNames))
+	}
+	if geminiReq.ToolConfig.FunctionCallingConfig.AllowedFunctionNames[0] != "get_weather" {
+		t.Errorf("expected 'get_weather', got '%s'", geminiReq.ToolConfig.FunctionCallingConfig.AllowedFunctionNames[0])
+	}
+}
+
+func TestTranslateResponsesToGeminiWithTopP(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "gemini-2.5-flash",
+		Input: json.RawMessage(`"test"`),
+		TopP:  float64Ptr(0.9),
+	}
+
+	geminiReq, err := translateResponsesToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if geminiReq.GenerationConfig == nil {
+		t.Fatal("expected generation config")
+	}
+	if geminiReq.GenerationConfig.TopP == nil {
+		t.Fatal("expected topP")
+	}
+	if *geminiReq.GenerationConfig.TopP != 0.9 {
+		t.Errorf("expected topP 0.9, got %f", *geminiReq.GenerationConfig.TopP)
+	}
+}
+
+func TestTranslateResponsesToGeminiWithMaxOutputTokens(t *testing.T) {
+	req := &ResponsesRequest{
+		Model:           "gemini-2.5-flash",
+		Input:           json.RawMessage(`"test"`),
+		MaxOutputTokens: intPtr(2048),
+	}
+
+	geminiReq, err := translateResponsesToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if geminiReq.GenerationConfig == nil {
+		t.Fatal("expected generation config")
+	}
+	if *geminiReq.GenerationConfig.MaxOutputTokens != 2048 {
+		t.Errorf("expected maxOutputTokens 2048, got %d", *geminiReq.GenerationConfig.MaxOutputTokens)
+	}
+}
+
+func TestTranslateGeminiToResponseMultipleFunctionCalls(t *testing.T) {
+	geminiResp := &GeminiResponse{
+		Candidates: []GeminiCandidate{
+			{
+				Content: GeminiContent{
+					Role: "model",
+					Parts: []GeminiPart{
+						{FunctionCall: &GeminiFuncCall{Name: "fn1", Args: json.RawMessage(`{}`)}},
+						{FunctionCall: &GeminiFuncCall{Name: "fn2", Args: json.RawMessage(`{}`)}},
+					},
+				},
+				FinishReason: "STOP",
+			},
+		},
+	}
+
+	resp := translateGeminiToResponse(geminiResp, "gemini-2.5-flash", nil)
+
+	if len(resp.Output) != 2 {
+		t.Fatalf("expected 2 output items, got %d", len(resp.Output))
+	}
+	if resp.Output[0].Type != "function_call" || resp.Output[0].Name != "fn1" {
+		t.Errorf("expected fn1, got %s/%s", resp.Output[0].Type, resp.Output[0].Name)
+	}
+	if resp.Output[1].Type != "function_call" || resp.Output[1].Name != "fn2" {
+		t.Errorf("expected fn2, got %s/%s", resp.Output[1].Type, resp.Output[1].Name)
+	}
+}
+
+func TestExtractTextFromJSONRawMessageString(t *testing.T) {
+	content := json.RawMessage(`"hello raw"`)
+	text := extractTextFromContent(content)
+	if text != "hello raw" {
+		t.Errorf("expected 'hello raw', got '%s'", text)
+	}
+}
+
+func TestExtractTextFromJSONRawMessageArray(t *testing.T) {
+	content := json.RawMessage(`[{"type":"text","text":"A"},{"type":"text","text":"B"}]`)
+	text := extractTextFromContent(content)
+	if text != "A\nB" {
+		t.Errorf("expected 'A\\nB', got '%s'", text)
+	}
+}
+
+

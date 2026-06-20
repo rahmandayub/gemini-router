@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,21 +29,167 @@ func NewOpenAIHandler(baseURL string, pool *key.Pool) *OpenAIHandler {
 }
 
 type OpenAIRequest struct {
-	Model       string          `json:"model"`
-	Messages    []OpenAIMessage `json:"messages"`
-	Tools       []OpenAITool    `json:"tools,omitempty"`
-	Temperature *float64        `json:"temperature,omitempty"`
-	MaxTokens   *int            `json:"max_tokens,omitempty"`
-	Stop        []string        `json:"stop,omitempty"`
-	Stream      bool            `json:"stream,omitempty"`
+	Model            string              `json:"model"`
+	Messages         []OpenAIMessage     `json:"messages"`
+	Tools            []OpenAITool        `json:"tools,omitempty"`
+	ToolChoice       json.RawMessage     `json:"tool_choice,omitempty"`
+	Temperature      *float64            `json:"temperature,omitempty"`
+	TopP             *float64            `json:"top_p,omitempty"`
+	MaxTokens        *int                `json:"max_tokens,omitempty"`
+	Stop             []string            `json:"stop,omitempty"`
+	Stream           bool                `json:"stream,omitempty"`
+	ResponseFormat   *OpenAIResponseFmt  `json:"response_format,omitempty"`
+	StreamOptions    *OpenAIStreamOpts   `json:"stream_options,omitempty"`
+	N                *int                `json:"n,omitempty"`
+	FrequencyPenalty *float64            `json:"frequency_penalty,omitempty"`
+	PresencePenalty  *float64            `json:"presence_penalty,omitempty"`
+	Seed             *int                `json:"seed,omitempty"`
+}
+
+type OpenAIResponseFmt struct {
+	Type      string          `json:"type"`
+	JSONSchema *OpenAIJSONSchema `json:"json_schema,omitempty"`
+}
+
+type OpenAIJSONSchema struct {
+	Name   string          `json:"name"`
+	Strict *bool           `json:"strict,omitempty"`
+	Schema json.RawMessage `json:"schema"`
+}
+
+type OpenAIStreamOpts struct {
+	IncludeUsage *bool `json:"include_usage,omitempty"`
 }
 
 type OpenAIMessage struct {
 	Role             string           `json:"role"`
-	Content          string           `json:"content"`
+	Content          json.RawMessage  `json:"content"`
 	ReasoningContent string           `json:"reasoning_content,omitempty"`
 	ToolCalls        []OpenAIToolCall `json:"tool_calls,omitempty"`
 	ToolCallID       string           `json:"tool_call_id,omitempty"`
+}
+
+type OpenAIMessageContentPart struct {
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL *struct {
+		URL    string `json:"url"`
+		Detail string `json:"detail,omitempty"`
+	} `json:"image_url,omitempty"`
+}
+
+func parseOpenAIContent(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var parts []OpenAIMessageContentPart
+	if err := json.Unmarshal(raw, &parts); err == nil {
+		var texts []string
+		for _, p := range parts {
+			if p.Type == "text" && p.Text != "" {
+				texts = append(texts, p.Text)
+			}
+		}
+		return strings.Join(texts, "\n")
+	}
+	return ""
+}
+
+func parseOpenAIContentParts(raw json.RawMessage) []OpenAIMessageContentPart {
+	if len(raw) == 0 {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return nil
+	}
+	var parts []OpenAIMessageContentPart
+	if err := json.Unmarshal(raw, &parts); err == nil {
+		return parts
+	}
+	return nil
+}
+
+func extractGeminiPartsFromContent(raw json.RawMessage) []GeminiPart {
+	parts := parseOpenAIContentParts(raw)
+	if len(parts) == 0 {
+		text := parseOpenAIContent(raw)
+		if text != "" {
+			return []GeminiPart{{Text: text}}
+		}
+		return nil
+	}
+	var geminiParts []GeminiPart
+	for _, p := range parts {
+		switch p.Type {
+		case "text":
+			if p.Text != "" {
+				geminiParts = append(geminiParts, GeminiPart{Text: p.Text})
+			}
+		case "image_url":
+			if p.ImageURL != nil && p.ImageURL.URL != "" {
+				if strings.HasPrefix(p.ImageURL.URL, "data:") {
+					parts := strings.SplitN(p.ImageURL.URL, ",", 2)
+					if len(parts) == 2 {
+						header := parts[0]
+						mimeType := strings.TrimPrefix(header, "data:")
+						mimeType = strings.TrimSuffix(mimeType, ";base64")
+						geminiParts = append(geminiParts, GeminiPart{
+							InlineData: &GeminiInlineData{
+								MimeType: mimeType,
+								Data:     parts[1],
+							},
+						})
+					}
+				} else if strings.HasPrefix(p.ImageURL.URL, "http://") || strings.HasPrefix(p.ImageURL.URL, "https://") {
+					if mimeType, data, err := fetchAndEncodeImage(p.ImageURL.URL); err == nil {
+						geminiParts = append(geminiParts, GeminiPart{
+							InlineData: &GeminiInlineData{
+								MimeType: mimeType,
+								Data:     data,
+							},
+						})
+					} else {
+						log.Printf("[proxy/openai] failed to fetch image URL %s: %v", p.ImageURL.URL, err)
+					}
+				}
+			}
+		}
+	}
+	return geminiParts
+}
+
+func fetchAndEncodeImage(url string) (mimeType string, base64Data string, err error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to fetch image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("image fetch returned status %d", resp.StatusCode)
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	} else {
+		if idx := strings.Index(contentType, ";"); idx != -1 {
+			contentType = contentType[:idx]
+		}
+	}
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read image data: %w", err)
+	}
+
+	return contentType, base64.StdEncoding.EncodeToString(data), nil
 }
 
 type OpenAIDelta struct {
@@ -131,11 +278,17 @@ type GeminiThinkingConfig struct {
 }
 
 type GeminiGenerationConfig struct {
-	Temperature     *float64              `json:"temperature,omitempty"`
-	TopP            *float64              `json:"topP,omitempty"`
-	MaxOutputTokens *int                  `json:"maxOutputTokens,omitempty"`
-	StopSequences   []string              `json:"stopSequences,omitempty"`
-	ThinkingConfig  *GeminiThinkingConfig `json:"thinkingConfig,omitempty"`
+	Temperature      *float64              `json:"temperature,omitempty"`
+	TopP             *float64              `json:"topP,omitempty"`
+	TopK             *int                  `json:"topK,omitempty"`
+	MaxOutputTokens  *int                  `json:"maxOutputTokens,omitempty"`
+	StopSequences    []string              `json:"stopSequences,omitempty"`
+	ThinkingConfig   *GeminiThinkingConfig `json:"thinkingConfig,omitempty"`
+	ResponseMimeType string                `json:"responseMimeType,omitempty"`
+	ResponseSchema   json.RawMessage       `json:"responseSchema,omitempty"`
+	FrequencyPenalty *float64              `json:"frequencyPenalty,omitempty"`
+	PresencePenalty  *float64              `json:"presencePenalty,omitempty"`
+	Seed             *int                  `json:"seed,omitempty"`
 }
 
 type GeminiResponse struct {
@@ -463,7 +616,9 @@ func (h *OpenAIHandler) handleNonStreamResponse(w http.ResponseWriter, resp *htt
 	if resp.StatusCode != http.StatusOK {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
-		w.Write(body)
+		errObj := translateGeminiErrorToOpenAI(body)
+		errBytes, _ := json.Marshal(errObj)
+		w.Write(errBytes)
 		return
 	}
 
@@ -493,7 +648,9 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 		if !headersWritten {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(resp.StatusCode)
-			w.Write(body)
+			errObj := translateGeminiErrorToOpenAI(body)
+			errBytes, _ := json.Marshal(errObj)
+			w.Write(errBytes)
 		} else {
 			// Send error as assistant text content to render in chat
 			errText := fmt.Sprintf("\n\n[Proxy Error: upstream returned error: %s]", string(body))
@@ -655,7 +812,7 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 				if part.ThoughtSignature != "" {
 					toolCallID := fmt.Sprintf("%s%s_%s_%d", OpenAICallPrefix, part.FunctionCall.Name, id, localIdx)
 					thoughtSignatureCache.Store(toolCallID, part.ThoughtSignature)
-					log.Printf("[proxy/stream] Stored stream thought signature for tool call %s", toolCallID)
+				log.Printf("[proxy/stream] Stored stream thought signature for tool call %s", toolCallID)
 				}
 				localIdx++
 			}
@@ -711,21 +868,24 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 
 	for _, msg := range req.Messages {
 		switch msg.Role {
-		case "system":
-			if msg.Content != "" {
-				systemParts = append(systemParts, GeminiPart{Text: msg.Content})
+		case "system", "developer":
+			text := parseOpenAIContent(msg.Content)
+			if text != "" {
+				systemParts = append(systemParts, GeminiPart{Text: text})
 			}
 		case "user":
-			contents = append(contents, GeminiContent{
-				Role: "user",
-				Parts: []GeminiPart{
-					{Text: msg.Content},
-				},
-			})
+			geminiParts := extractGeminiPartsFromContent(msg.Content)
+			if len(geminiParts) > 0 {
+				contents = append(contents, GeminiContent{
+					Role:  "user",
+					Parts: geminiParts,
+				})
+			}
 		case "assistant":
 			var parts []GeminiPart
-			if msg.Content != "" {
-				parts = append(parts, GeminiPart{Text: msg.Content})
+			text := parseOpenAIContent(msg.Content)
+			if text != "" {
+				parts = append(parts, GeminiPart{Text: text})
 			}
 			if len(msg.ToolCalls) > 0 {
 				for _, tc := range msg.ToolCalls {
@@ -733,12 +893,7 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 					if tc.Function.Arguments != "" {
 						args = json.RawMessage(tc.Function.Arguments)
 					}
-					var thoughtSig string
-					if val, ok := thoughtSignatureCache.Load(tc.ID); ok {
-						if sig, ok := val.(string); ok {
-							thoughtSig = sig
-						}
-					}
+					thoughtSig, _ := thoughtSignatureCache.Load(tc.ID)
 					parts = append(parts, GeminiPart{
 						FunctionCall: &GeminiFuncCall{
 							Name: tc.Function.Name,
@@ -756,12 +911,13 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 			}
 		case "tool":
 			var args interface{}
-			if msg.Content != "" {
+			content := parseOpenAIContent(msg.Content)
+			if content != "" {
 				var parsedJSON interface{}
-				if err := json.Unmarshal([]byte(msg.Content), &parsedJSON); err == nil {
+				if err := json.Unmarshal([]byte(content), &parsedJSON); err == nil {
 					args = parsedJSON
 				} else {
-					args = msg.Content
+					args = content
 				}
 			} else {
 				args = ""
@@ -831,9 +987,17 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 		geminiReq.Tools = tools
 	}
 
+	toolChoiceType, toolChoiceName, _ := parseToolChoice(req.ToolChoice)
+	if len(req.Tools) > 0 && (toolChoiceType != "" || toolChoiceName != "") {
+		geminiReq.ToolConfig = translateToolChoice(toolChoiceType, toolChoiceName)
+	}
+
 	genConfig := &GeminiGenerationConfig{}
 	if req.Temperature != nil {
 		genConfig.Temperature = req.Temperature
+	}
+	if req.TopP != nil {
+		genConfig.TopP = req.TopP
 	}
 	if req.MaxTokens != nil {
 		genConfig.MaxOutputTokens = req.MaxTokens
@@ -841,7 +1005,37 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 	if len(req.Stop) > 0 {
 		genConfig.StopSequences = req.Stop
 	}
-	geminiReq.GenerationConfig = genConfig
+
+	if req.ResponseFormat != nil {
+		switch req.ResponseFormat.Type {
+		case "json_object":
+			genConfig.ResponseMimeType = "application/json"
+		case "json_schema":
+			genConfig.ResponseMimeType = "application/json"
+			if req.ResponseFormat.JSONSchema != nil {
+				schema := req.ResponseFormat.JSONSchema.Schema
+				cleaned, err := cleanSchema(schema)
+				if err == nil {
+					schema = cleaned
+				}
+				genConfig.ResponseSchema = schema
+			}
+		}
+	}
+
+	if req.FrequencyPenalty != nil {
+		genConfig.FrequencyPenalty = req.FrequencyPenalty
+	}
+	if req.PresencePenalty != nil {
+		genConfig.PresencePenalty = req.PresencePenalty
+	}
+	if req.Seed != nil {
+		genConfig.Seed = req.Seed
+	}
+
+	if genConfig.Temperature != nil || genConfig.TopP != nil || genConfig.MaxOutputTokens != nil || genConfig.ResponseMimeType != "" || len(genConfig.StopSequences) > 0 || genConfig.FrequencyPenalty != nil || genConfig.PresencePenalty != nil || genConfig.Seed != nil {
+		geminiReq.GenerationConfig = genConfig
+	}
 
 	return geminiReq, nil
 }
@@ -928,22 +1122,23 @@ func translateFromGemini(resp *GeminiResponse, model string, id string, created 
 					},
 				})
 				if part.ThoughtSignature != "" {
-					thoughtSignatureCache.Store(toolCallID, part.ThoughtSignature)
-					log.Printf("[proxy] Stored non-stream thought signature for tool call %s", toolCallID)
-				}
+				thoughtSignatureCache.Store(toolCallID, part.ThoughtSignature)
+				log.Printf("[proxy] Stored non-stream thought signature for tool call %s", toolCallID)
+			}
 			}
 		}
 
 		if len(textParts) > 0 {
-			msg.Content = strings.Join(textParts, "")
+			contentJSON, _ := json.Marshal(strings.Join(textParts, ""))
+			msg.Content = contentJSON
 		}
 		if len(reasoningParts) > 0 {
 			msg.ReasoningContent = strings.Join(reasoningParts, "")
 		}
 		if len(toolCalls) > 0 {
 			msg.ToolCalls = toolCalls
-			if msg.Content == "" {
-				msg.Content = ""
+			if len(msg.Content) == 0 {
+				msg.Content = json.RawMessage(`""`)
 			}
 			finishReason = "tool_calls"
 		}
@@ -1039,8 +1234,10 @@ func mapGeminiFinishReason(reason string) string {
 		return "stop"
 	case "MAX_TOKENS":
 		return "length"
-	case "SAFETY":
+	case "SAFETY", "RECITATION", "OTHER", "BLOCKLIST":
 		return "content_filter"
+	case "MALFORMED_FUNCTION_CALL":
+		return "stop"
 	default:
 		return "stop"
 	}

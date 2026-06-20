@@ -36,6 +36,8 @@ type AnthropicRequest struct {
 	System        json.RawMessage      `json:"system,omitempty"`
 	MaxTokens     int                  `json:"max_tokens"`
 	Temperature   *float64             `json:"temperature,omitempty"`
+	TopP          *float64             `json:"top_p,omitempty"`
+	TopK          *int                 `json:"top_k,omitempty"`
 	StopSequences []string             `json:"stop_sequences,omitempty"`
 	Stream        bool                 `json:"stream,omitempty"`
 	Tools         []AnthropicTool      `json:"tools,omitempty"`
@@ -439,7 +441,9 @@ func (h *AnthropicHandler) handleNonStreamResponse(w http.ResponseWriter, resp *
 	if resp.StatusCode != http.StatusOK {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
-		w.Write(body)
+		errObj := translateGeminiErrorToAnthropic(body)
+		errBytes, _ := json.Marshal(errObj)
+		w.Write(errBytes)
 		return
 	}
 
@@ -467,10 +471,12 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 		body, _ := io.ReadAll(resp.Body)
 		log.Printf("[proxy/stream] Anthropic upstream returned non-OK status: %d, body: %s", resp.StatusCode, string(body))
 		if !headersWritten {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
-			w.WriteHeader(http.StatusOK)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.StatusCode)
+			errObj := translateGeminiErrorToAnthropic(body)
+			errBytes, _ := json.Marshal(errObj)
+			w.Write(errBytes)
+			return
 		}
 
 		// Send error as assistant text content to render in chat
@@ -763,7 +769,7 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 				toolID := generateToolUseID()
 				if part.ThoughtSignature != "" {
 					thoughtSignatureCache.Store(toolID, part.ThoughtSignature)
-					log.Printf("[proxy/anthropic] Stored stream thought signature for tool call %s", toolID)
+				log.Printf("[proxy/anthropic] Stored stream thought signature for tool call %s", toolID)
 				}
 				startEvent := AnthropicStreamContentBlockStart{
 					Type:  "content_block_start",
@@ -779,18 +785,27 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 				WriteSSEEvent(w, "content_block_start", eventData)
 				currentBlockType = "tool_use"
 
-				// Send tool input as partial JSON
+				// Send tool input as incremental partial JSON
 				argsJSON, _ := json.Marshal(part.FunctionCall.Args)
-				delta := AnthropicStreamContentBlockDelta{
-					Type:  "content_block_delta",
-					Index: blockIndex,
-					Delta: &AnthropicStreamInputJSONDelta{
-						Type:        "input_json_delta",
-						PartialJSON: string(argsJSON),
-					},
+				argsStr := string(argsJSON)
+				argsLen := len(argsStr)
+				const chunkSize = 32
+				for i := 0; i < argsLen; i += chunkSize {
+					end := i + chunkSize
+					if end > argsLen {
+						end = argsLen
+					}
+					delta := AnthropicStreamContentBlockDelta{
+						Type:  "content_block_delta",
+						Index: blockIndex,
+						Delta: &AnthropicStreamInputJSONDelta{
+							Type:        "input_json_delta",
+							PartialJSON: argsStr[i:end],
+						},
+					}
+					eventData, _ = json.Marshal(delta)
+					WriteSSEEvent(w, "content_block_delta", eventData)
 				}
-				eventData, _ = json.Marshal(delta)
-				WriteSSEEvent(w, "content_block_delta", eventData)
 				sentAny = true
 			}
 		}
@@ -957,6 +972,12 @@ func translateAnthropicToGemini(req *AnthropicRequest) (*GeminiRequest, error) {
 	if req.Temperature != nil {
 		genConfig.Temperature = req.Temperature
 	}
+	if req.TopP != nil {
+		genConfig.TopP = req.TopP
+	}
+	if req.TopK != nil {
+		genConfig.TopK = req.TopK
+	}
 	if req.MaxTokens > 0 {
 		genConfig.MaxOutputTokens = &req.MaxTokens
 	}
@@ -975,7 +996,14 @@ func translateAnthropicToGemini(req *AnthropicRequest) (*GeminiRequest, error) {
 		}
 	}
 
-	geminiReq.GenerationConfig = genConfig
+	if genConfig.Temperature != nil || genConfig.TopP != nil || genConfig.TopK != nil || genConfig.MaxOutputTokens != nil {
+		geminiReq.GenerationConfig = genConfig
+	}
+
+	// Translate tool_choice to toolConfig
+	if req.ToolChoice != nil && len(req.Tools) > 0 {
+		geminiReq.ToolConfig = translateAnthropicToolChoice(req.ToolChoice)
+	}
 
 	return geminiReq, nil
 }
@@ -1007,11 +1035,7 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 					argsJSON, _ := json.Marshal(input)
 					var thoughtSig string
 					if id != "" {
-						if val, ok := thoughtSignatureCache.Load(id); ok {
-							if sig, ok := val.(string); ok {
-								thoughtSig = sig
-							}
-						}
+						thoughtSig, _ = thoughtSignatureCache.Load(id)
 					}
 					parts = append(parts, GeminiPart{
 						FunctionCall: &GeminiFuncCall{
@@ -1031,7 +1055,24 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 							"error": resultContent,
 						}
 					} else {
-						responseValue = resultContent
+						switch c := resultContent.(type) {
+						case []interface{}:
+							var texts []string
+							for _, item := range c {
+								if m, ok := item.(map[string]interface{}); ok {
+									if t, ok := m["text"].(string); ok {
+										texts = append(texts, t)
+									}
+								}
+							}
+							if len(texts) > 0 {
+								responseValue = strings.Join(texts, "\n")
+							} else {
+								responseValue = resultContent
+							}
+						default:
+							responseValue = resultContent
+						}
 					}
 
 					// Look up function name from the map
@@ -1168,9 +1209,35 @@ func mapGeminiFinishReasonToAnthropic(reason string) string {
 		return "end_turn"
 	case "MAX_TOKENS":
 		return "max_tokens"
-	case "SAFETY":
-		return "end_turn"
+	case "SAFETY", "RECITATION", "OTHER", "BLOCKLIST":
+		return "stop"
+	case "MALFORMED_FUNCTION_CALL":
+		return "stop"
 	default:
-		return "end_turn"
+		return "stop"
 	}
+}
+
+func translateAnthropicToolChoice(tc *AnthropicToolChoice) *GeminiToolConfig {
+	config := &GeminiToolConfig{
+		FunctionCallingConfig: &GeminiFunctionCallingConfig{},
+	}
+
+	switch tc.Type {
+	case "auto":
+		config.FunctionCallingConfig.Mode = "AUTO"
+	case "any":
+		config.FunctionCallingConfig.Mode = "ANY"
+	case "none":
+		config.FunctionCallingConfig.Mode = "NONE"
+	case "tool":
+		config.FunctionCallingConfig.Mode = "ANY"
+		if tc.Name != "" {
+			config.FunctionCallingConfig.AllowedFunctionNames = []string{tc.Name}
+		}
+	default:
+		config.FunctionCallingConfig.Mode = "AUTO"
+	}
+
+	return config
 }

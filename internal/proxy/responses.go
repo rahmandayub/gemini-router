@@ -43,6 +43,18 @@ type ResponsesRequest struct {
 	ParallelToolCalls  *bool           `json:"parallel_tool_calls,omitempty"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
 	Include            []string        `json:"include,omitempty"`
+	Text               *ResponseText   `json:"text,omitempty"`
+}
+
+type ResponseText struct {
+	Format *ResponseTextFormat `json:"format,omitempty"`
+}
+
+type ResponseTextFormat struct {
+	Type       string          `json:"type"`
+	Name       string          `json:"name,omitempty"`
+	Strict     *bool           `json:"strict,omitempty"`
+	Schema     json.RawMessage `json:"schema,omitempty"`
 }
 
 type ResponseTool struct {
@@ -54,14 +66,15 @@ type ResponseTool struct {
 }
 
 type ResponseInputItem struct {
-	Type    string          `json:"type,omitempty"`
-	Role    string          `json:"role,omitempty"`
-	Content json.RawMessage `json:"content,omitempty"`
-	CallID  string          `json:"call_id,omitempty"`
-	Name    string          `json:"name,omitempty"`
-	Output  string          `json:"output,omitempty"`
-	ID      string          `json:"id,omitempty"`
-	Summary json.RawMessage `json:"summary,omitempty"`
+	Type      string          `json:"type,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	CallID    string          `json:"call_id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Output    string          `json:"output,omitempty"`
+	ID        string          `json:"id,omitempty"`
+	Summary   json.RawMessage `json:"summary,omitempty"`
+	Arguments string          `json:"arguments,omitempty"`
 }
 
 // Responses API Response Types
@@ -242,10 +255,16 @@ func translateResponsesToGemini(req *ResponsesRequest) (*GeminiRequest, error) {
 		declarations := make([]GeminiFuncDecl, 0, len(req.Tools))
 		for _, tool := range req.Tools {
 			if tool.Type == "function" {
+				cleaned := tool.Parameters
+				if len(cleaned) > 0 {
+					if c, err := cleanSchema(cleaned); err == nil {
+						cleaned = c
+					}
+				}
 				decl := GeminiFuncDecl{
 					Name:        tool.Name,
 					Description: tool.Description,
-					Parameters:  tool.Parameters,
+					Parameters:  cleaned,
 				}
 				declarations = append(declarations, decl)
 			}
@@ -272,7 +291,26 @@ func translateResponsesToGemini(req *ResponsesRequest) (*GeminiRequest, error) {
 	if req.MaxOutputTokens != nil {
 		genConfig.MaxOutputTokens = req.MaxOutputTokens
 	}
-	if genConfig.Temperature != nil || genConfig.TopP != nil || genConfig.MaxOutputTokens != nil {
+
+	// Handle text format (structured output)
+	if req.Text != nil && req.Text.Format != nil {
+		switch req.Text.Format.Type {
+		case "json_object":
+			genConfig.ResponseMimeType = "application/json"
+		case "json_schema":
+			genConfig.ResponseMimeType = "application/json"
+			if len(req.Text.Format.Schema) > 0 {
+				cleaned, err := cleanSchema(req.Text.Format.Schema)
+				if err == nil {
+					genConfig.ResponseSchema = cleaned
+				} else {
+					genConfig.ResponseSchema = req.Text.Format.Schema
+				}
+			}
+		}
+	}
+
+	if genConfig.Temperature != nil || genConfig.TopP != nil || genConfig.MaxOutputTokens != nil || genConfig.ResponseMimeType != "" {
 		geminiReq.GenerationConfig = genConfig
 	}
 
@@ -282,6 +320,21 @@ func translateResponsesToGemini(req *ResponsesRequest) (*GeminiRequest, error) {
 // translateInputItemToContent translates a single input item to Gemini content
 func translateInputItemToContent(item ResponseInputItem) (*GeminiContent, error) {
 	switch item.Type {
+	case "function_call":
+		var args json.RawMessage
+		if item.Arguments != "" {
+			args = json.RawMessage(item.Arguments)
+		}
+		return &GeminiContent{
+			Role: "model",
+			Parts: []GeminiPart{{
+				FunctionCall: &GeminiFuncCall{
+					Name: item.Name,
+					Args: args,
+				},
+			}},
+		}, nil
+
 	case "function_call_output":
 		// Function call output needs name field
 		if item.Name == "" {
@@ -524,8 +577,10 @@ func mapFinishReason(finishReason string) (string, *IncompleteDetails) {
 		return "completed", nil
 	case "MAX_TOKENS":
 		return "incomplete", &IncompleteDetails{Reason: "max_output_tokens"}
-	case "SAFETY", "RECITATION", "OTHER":
+	case "SAFETY", "RECITATION", "OTHER", "BLOCKLIST":
 		return "incomplete", &IncompleteDetails{Reason: "content_filter"}
+	case "MALFORMED_FUNCTION_CALL":
+		return "failed", &IncompleteDetails{Reason: "tool_call_error"}
 	default:
 		return "completed", nil
 	}
@@ -684,7 +739,8 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode != http.StatusOK {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
-		w.Write(respBody)
+		errObj := translateGeminiErrorToResponses(respBody)
+		json.NewEncoder(w).Encode(errObj)
 		return
 	}
 
@@ -844,10 +900,14 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	var currentText strings.Builder
-	itemID := generateItemID("msg_")
+	var currentReasoning strings.Builder
 	outputIndex := 0
 	contentIndex := 0
 	itemStarted := false
+	reasoningStarted := false
+	reasoningItemID := generateItemID("rs_")
+	itemID := generateItemID("msg_")
+	var usageMetadata *GeminiUsageMetadata
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -862,11 +922,13 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 		}
 
 		// Parse Gemini SSE chunk
-		var chunk struct {
-			Candidates []GeminiCandidate `json:"candidates"`
-		}
+		var chunk GeminiResponse
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
+		}
+
+		if chunk.UsageMetadata != nil {
+			usageMetadata = chunk.UsageMetadata
 		}
 
 		if len(chunk.Candidates) == 0 {
@@ -876,16 +938,57 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 		candidate := chunk.Candidates[0]
 
 		for _, part := range candidate.Content.Parts {
-			// Skip thought parts (reasoning)
+			// Handle reasoning (thought) parts
 			if part.Thought {
+				if !reasoningStarted {
+					addEvent := ResponseStreamEvent{
+						Type:        "response.output_item.added",
+						OutputIndex: outputIndex,
+						Item: ResponseOutputItem{
+							Type:   "reasoning",
+							ID:     reasoningItemID,
+							Status: "in_progress",
+							Summary: mustMarshal([]ResponseSummaryContent{{
+								Type: "summary_text",
+								Text: "",
+							}}),
+						},
+						SequenceNumber: seqNum,
+					}
+					eventData, _ := json.Marshal(addEvent)
+					w.Write([]byte("data: "))
+					w.Write(eventData)
+					w.Write([]byte("\n\n"))
+					flusher.Flush()
+					seqNum++
+					reasoningStarted = true
+				}
+
+				if part.Text != "" {
+					currentReasoning.WriteString(part.Text)
+
+					deltaEvent := ResponseStreamEvent{
+						Type:           "response.reasoning_summary_text.delta",
+						OutputIndex:    outputIndex,
+						ContentIndex:   0,
+						ItemID:         reasoningItemID,
+						Delta:          part.Text,
+						SequenceNumber: seqNum,
+					}
+					eventData, _ := json.Marshal(deltaEvent)
+					w.Write([]byte("data: "))
+					w.Write(eventData)
+					w.Write([]byte("\n\n"))
+					flusher.Flush()
+					seqNum++
+				}
 				continue
 			}
 
 			// Handle function calls
 			if part.FunctionCall != nil {
-				// Send item added event if not started
+				fcItemID := generateItemID("fc_")
 				if !itemStarted {
-					fcItemID := generateItemID("fc_")
 					addEvent := ResponseStreamEvent{
 						Type:        "response.output_item.added",
 						OutputIndex: outputIndex,
@@ -905,15 +1008,35 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 					itemStarted = true
 				}
 
-				// Parse function call args
 				argsJSON, _ := json.Marshal(part.FunctionCall.Args)
+				argsStr := string(argsJSON)
+				argsLen := len(argsStr)
+				const chunkSize = 32
+				for i := 0; i < argsLen; i += chunkSize {
+					end := i + chunkSize
+					if end > argsLen {
+						end = argsLen
+					}
+					deltaEvent := ResponseStreamEvent{
+						Type:           "response.function_call_arguments.delta",
+						OutputIndex:    outputIndex,
+						ItemID:         fcItemID,
+						Delta:          argsStr[i:end],
+						SequenceNumber: seqNum,
+					}
+					eventData, _ := json.Marshal(deltaEvent)
+					w.Write([]byte("data: "))
+					w.Write(eventData)
+					w.Write([]byte("\n\n"))
+					flusher.Flush()
+					seqNum++
+				}
 
-				// Send function call arguments done event
 				fcDoneEvent := ResponseStreamEvent{
 					Type:           "response.function_call_arguments.done",
 					OutputIndex:    outputIndex,
-					ItemID:         itemID,
-					Delta:          string(argsJSON),
+					ItemID:         fcItemID,
+					Delta:          argsStr,
 					SequenceNumber: seqNum,
 				}
 				eventData, _ := json.Marshal(fcDoneEvent)
@@ -928,7 +1051,6 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 
 			// Handle text content
 			if part.Text != "" {
-				// Send item added event if not started
 				if !itemStarted {
 					addEvent := ResponseStreamEvent{
 						Type:        "response.output_item.added",
@@ -949,7 +1071,6 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 					flusher.Flush()
 					seqNum++
 
-					// Send content part added event
 					partAddEvent := ResponseStreamEvent{
 						Type:         "response.content_part.added",
 						OutputIndex:  outputIndex,
@@ -971,7 +1092,6 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 					itemStarted = true
 				}
 
-				// Send text delta event
 				deltaEvent := ResponseStreamEvent{
 					Type:           "response.output_text.delta",
 					OutputIndex:    outputIndex,
@@ -994,7 +1114,36 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 
 		// Check if candidate is complete
 		if candidate.FinishReason != "" {
-			// Send content part done event
+			// Close reasoning block if open
+			if reasoningStarted {
+				reasoningDoneEvent := ResponseStreamEvent{
+					Type:        "response.output_item.done",
+					OutputIndex: outputIndex,
+					Item: ResponseOutputItem{
+						Type:   "reasoning",
+						ID:     reasoningItemID,
+						Status: "completed",
+						Summary: mustMarshal([]ResponseSummaryContent{{
+							Type: "summary_text",
+							Text: currentReasoning.String(),
+						}}),
+						Content: mustMarshal([]ResponseReasoningContent{{
+							Type: "reasoning_text",
+							Text: currentReasoning.String(),
+						}}),
+					},
+					SequenceNumber: seqNum,
+				}
+				eventData, _ := json.Marshal(reasoningDoneEvent)
+				w.Write([]byte("data: "))
+				w.Write(eventData)
+				w.Write([]byte("\n\n"))
+				flusher.Flush()
+				seqNum++
+				outputIndex++
+			}
+
+			// Close text block if open
 			if itemStarted && currentText.Len() > 0 {
 				partDoneEvent := ResponseStreamEvent{
 					Type:         "response.content_part.done",
@@ -1016,7 +1165,6 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 				seqNum++
 			}
 
-			// Send output item done event
 			if itemStarted {
 				itemDoneEvent := ResponseStreamEvent{
 					Type:        "response.output_item.done",
@@ -1042,23 +1190,49 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 				seqNum++
 			}
 
-			// Build final response
 			completedAt := time.Now().Unix()
 			response.Status, response.IncompleteDetails = mapFinishReason(candidate.FinishReason)
 			response.CompletedAt = &completedAt
-			response.Output = []ResponseOutputItem{{
-				Type:   "message",
-				ID:     itemID,
-				Status: response.Status,
-				Role:   "assistant",
-				Content: mustMarshal([]ResponseMessageContent{{
-					Type:        "output_text",
-					Text:        currentText.String(),
-					Annotations: json.RawMessage("[]"),
-				}}),
-			}}
 
-			// Send response.completed event
+			if usageMetadata != nil {
+				response.Usage = &ResponseUsage{
+					InputTokens:  usageMetadata.PromptTokenCount,
+					OutputTokens: usageMetadata.CandidatesTokenCount,
+					TotalTokens:  usageMetadata.TotalTokenCount,
+				}
+			}
+
+			var outputItems []ResponseOutputItem
+			if reasoningStarted {
+				outputItems = append(outputItems, ResponseOutputItem{
+					Type:   "reasoning",
+					ID:     reasoningItemID,
+					Status: response.Status,
+					Summary: mustMarshal([]ResponseSummaryContent{{
+						Type: "summary_text",
+						Text: currentReasoning.String(),
+					}}),
+					Content: mustMarshal([]ResponseReasoningContent{{
+						Type: "reasoning_text",
+						Text: currentReasoning.String(),
+					}}),
+				})
+			}
+			if currentText.Len() > 0 {
+				outputItems = append(outputItems, ResponseOutputItem{
+					Type:   "message",
+					ID:     itemID,
+					Status: response.Status,
+					Role:   "assistant",
+					Content: mustMarshal([]ResponseMessageContent{{
+						Type:        "output_text",
+						Text:        currentText.String(),
+						Annotations: json.RawMessage("[]"),
+					}}),
+				})
+			}
+			response.Output = outputItems
+
 			completedEvent := ResponseStreamEvent{
 				Type:           "response.completed",
 				Response:       response,
@@ -1078,8 +1252,31 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 	completedAt := time.Now().Unix()
 	response.Status = "completed"
 	response.CompletedAt = &completedAt
+	if usageMetadata != nil {
+		response.Usage = &ResponseUsage{
+			InputTokens:  usageMetadata.PromptTokenCount,
+			OutputTokens: usageMetadata.CandidatesTokenCount,
+			TotalTokens:  usageMetadata.TotalTokenCount,
+		}
+	}
+	var outputItems []ResponseOutputItem
+	if reasoningStarted {
+		outputItems = append(outputItems, ResponseOutputItem{
+			Type:   "reasoning",
+			ID:     reasoningItemID,
+			Status: "completed",
+			Summary: mustMarshal([]ResponseSummaryContent{{
+				Type: "summary_text",
+				Text: currentReasoning.String(),
+			}}),
+			Content: mustMarshal([]ResponseReasoningContent{{
+				Type: "reasoning_text",
+				Text: currentReasoning.String(),
+			}}),
+		})
+	}
 	if currentText.Len() > 0 {
-		response.Output = []ResponseOutputItem{{
+		outputItems = append(outputItems, ResponseOutputItem{
 			Type:   "message",
 			ID:     itemID,
 			Status: "completed",
@@ -1089,8 +1286,9 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 				Text:        currentText.String(),
 				Annotations: json.RawMessage("[]"),
 			}}),
-		}}
+		})
 	}
+	response.Output = outputItems
 
 	completedEvent := ResponseStreamEvent{
 		Type:           "response.completed",
