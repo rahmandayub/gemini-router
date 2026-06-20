@@ -94,7 +94,7 @@ func TestTranslateFromGeminiToAnthropicText(t *testing.T) {
 		},
 	}
 
-	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test123", false)
+	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test123")
 
 	if anthropicResp.ID != "msg_test123" {
 		t.Errorf("expected ID 'msg_test123', got '%s'", anthropicResp.ID)
@@ -148,7 +148,7 @@ func TestTranslateFromGeminiToAnthropicWithThinking(t *testing.T) {
 		},
 	}
 
-	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test", true)
+	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test")
 
 	if len(anthropicResp.Content) != 2 {
 		t.Fatalf("expected 2 content blocks (thinking + text), got %d", len(anthropicResp.Content))
@@ -169,7 +169,7 @@ func TestTranslateFromGeminiToAnthropicWithThinking(t *testing.T) {
 	}
 }
 
-func TestTranslateFromGeminiToAnthropicThinkingSuppressed(t *testing.T) {
+func TestTranslateFromGeminiToAnthropicThinkingAlwaysIncluded(t *testing.T) {
 	resp := &GeminiResponse{
 		Candidates: []GeminiCandidate{
 			{
@@ -185,14 +185,21 @@ func TestTranslateFromGeminiToAnthropicThinkingSuppressed(t *testing.T) {
 		},
 	}
 
-	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test", false)
+	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test")
 
-	if len(anthropicResp.Content) != 1 {
-		t.Fatalf("expected 1 content block (thinking suppressed), got %d", len(anthropicResp.Content))
+	if len(anthropicResp.Content) != 2 {
+		t.Fatalf("expected 2 content blocks (thinking + text), got %d", len(anthropicResp.Content))
 	}
-	textBlock, ok := anthropicResp.Content[0].(*AnthropicRespTextBlock)
+	thinkingBlock, ok := anthropicResp.Content[0].(*AnthropicRespThinkingBlock)
 	if !ok {
-		t.Fatalf("expected *AnthropicRespTextBlock, got %T", anthropicResp.Content[0])
+		t.Fatalf("expected *AnthropicRespThinkingBlock, got %T", anthropicResp.Content[0])
+	}
+	if thinkingBlock.Thinking != "internal thought" {
+		t.Errorf("expected thinking 'internal thought', got '%s'", thinkingBlock.Thinking)
+	}
+	textBlock, ok := anthropicResp.Content[1].(*AnthropicRespTextBlock)
+	if !ok {
+		t.Fatalf("expected *AnthropicRespTextBlock, got %T", anthropicResp.Content[1])
 	}
 	if textBlock.Text != "visible answer" {
 		t.Errorf("expected text 'visible answer', got '%s'", textBlock.Text)
@@ -219,7 +226,7 @@ func TestTranslateFromGeminiToAnthropicToolCall(t *testing.T) {
 		},
 	}
 
-	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test", false)
+	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test")
 
 	if anthropicResp.StopReason != "tool_use" {
 		t.Errorf("expected stop_reason 'tool_use', got '%s'", anthropicResp.StopReason)
@@ -247,7 +254,7 @@ func TestTranslateFromGeminiToAnthropicEmptyCandidates(t *testing.T) {
 		Candidates: []GeminiCandidate{},
 	}
 
-	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test", false)
+	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test")
 
 	if len(anthropicResp.Content) != 0 {
 		t.Errorf("expected 0 content blocks, got %d", len(anthropicResp.Content))
@@ -273,7 +280,7 @@ func TestTranslateFromGeminiToAnthropicEmptyParts(t *testing.T) {
 		},
 	}
 
-	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test", false)
+	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test")
 
 	if anthropicResp.Content == nil {
 		t.Error("expected Content to be non-nil empty slice, got nil")
@@ -299,7 +306,7 @@ func TestTranslateFromGeminiToAnthropicSafetyFinish(t *testing.T) {
 		},
 	}
 
-	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test", false)
+	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test")
 	if anthropicResp.StopReason != "stop" {
 		t.Errorf("expected stop_reason 'stop' for SAFETY, got '%s'", anthropicResp.StopReason)
 	}
@@ -326,7 +333,7 @@ func TestTranslateFromGeminiToAnthropicToolCallThoughtSignature(t *testing.T) {
 		},
 	}
 
-	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test", false)
+	anthropicResp := translateFromGeminiToAnthropic(resp, "gemini-2.5-flash", "msg_test")
 
 	toolBlock := anthropicResp.Content[0].(*AnthropicRespToolUseBlock)
 	val, ok := thoughtSignatureCache.Load(toolBlock.ID)

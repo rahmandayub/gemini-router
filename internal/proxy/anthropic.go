@@ -214,7 +214,6 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	upstreamURL := fmt.Sprintf("%s/v1beta/models/%s:%s", h.geminiBaseURL, anthropicReq.Model, endpoint)
 
 	msgID := generateAnthropicID()
-	clientSupportsThinking := anthropicReq.Thinking != nil && anthropicReq.Thinking.Type == "enabled"
 
 	var resp *http.Response
 	var lastErr error
@@ -352,7 +351,7 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer resp.Body.Close()
 
-		h.handleStreamResponse(w, resp, anthropicReq.Model, msgID, clientSupportsThinking, true)
+		h.handleStreamResponse(w, resp, anthropicReq.Model, msgID, true)
 	} else {
 		// Non-stream flow (normal retry loop)
 		for attempt := 0; attempt < maxRetries; attempt++ {
@@ -402,11 +401,11 @@ func (h *AnthropicHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		defer resp.Body.Close()
 
-		h.handleNonStreamResponse(w, resp, anthropicReq.Model, msgID, clientSupportsThinking)
+		h.handleNonStreamResponse(w, resp, anthropicReq.Model, msgID)
 	}
 }
 
-func (h *AnthropicHandler) handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model string, msgID string, clientSupportsThinking bool) {
+func (h *AnthropicHandler) handleNonStreamResponse(w http.ResponseWriter, resp *http.Response, model string, msgID string) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, "failed to read upstream response", http.StatusBadGateway)
@@ -428,7 +427,7 @@ func (h *AnthropicHandler) handleNonStreamResponse(w http.ResponseWriter, resp *
 		return
 	}
 
-	anthropicResp := translateFromGeminiToAnthropic(&geminiResp, model, msgID, clientSupportsThinking)
+	anthropicResp := translateFromGeminiToAnthropic(&geminiResp, model, msgID)
 	respBody, err := json.Marshal(anthropicResp)
 	if err != nil {
 		log.Printf("[proxy/anthropic] marshal response error: %v", err)
@@ -441,7 +440,7 @@ func (h *AnthropicHandler) handleNonStreamResponse(w http.ResponseWriter, resp *
 	w.Write(respBody)
 }
 
-func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, msgID string, clientSupportsThinking bool, headersWritten bool) {
+func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *http.Response, model string, msgID string, headersWritten bool) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		log.Printf("[proxy/stream] Anthropic upstream returned non-OK status: %d, body: %s", resp.StatusCode, string(body))
@@ -660,14 +659,6 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 		for _, part := range candidate.Content.Parts {
 			if part.Text != "" {
 				if part.Thought {
-					if !clientSupportsThinking {
-						// Send a ping keepalive to prevent connection timeout while model is thinking
-						pingEvent := map[string]interface{}{"type": "ping"}
-						pingData, _ := json.Marshal(pingEvent)
-						WriteSSEEvent(w, "ping", pingData)
-						sentAny = true
-						continue
-					}
 					// Handle thinking content
 					if currentBlockType != "thinking" {
 						// Close previous block if any
@@ -1133,7 +1124,7 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 	return parts
 }
 
-func translateFromGeminiToAnthropic(resp *GeminiResponse, model string, msgID string, clientSupportsThinking bool) *AnthropicResponse {
+func translateFromGeminiToAnthropic(resp *GeminiResponse, model string, msgID string) *AnthropicResponse {
 	anthropicResp := &AnthropicResponse{
 		ID:      msgID,
 		Type:    "message",
@@ -1160,12 +1151,10 @@ func translateFromGeminiToAnthropic(resp *GeminiResponse, model string, msgID st
 	for _, part := range candidate.Content.Parts {
 		if part.Text != "" {
 			if part.Thought {
-				if clientSupportsThinking {
-					contentBlocks = append(contentBlocks, &AnthropicRespThinkingBlock{
-						Type:     "thinking",
-						Thinking: part.Text,
-					})
-				}
+				contentBlocks = append(contentBlocks, &AnthropicRespThinkingBlock{
+					Type:     "thinking",
+					Thinking: part.Text,
+				})
 			} else {
 				contentBlocks = append(contentBlocks, &AnthropicRespTextBlock{
 					Type: "text",
