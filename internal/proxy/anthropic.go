@@ -57,20 +57,6 @@ type AnthropicTextBlock struct {
 	Text string `json:"text"`
 }
 
-type AnthropicToolUseBlock struct {
-	Type  string                 `json:"type"`
-	ID    string                 `json:"id"`
-	Name  string                 `json:"name"`
-	Input map[string]interface{} `json:"input"`
-}
-
-type AnthropicToolResultBlock struct {
-	Type      string      `json:"type"`
-	ToolUseID string      `json:"tool_use_id"`
-	Content   interface{} `json:"content,omitempty"`
-	IsError   bool        `json:"is_error,omitempty"`
-}
-
 type AnthropicTool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
@@ -126,13 +112,6 @@ type AnthropicUsage struct {
 
 // Streaming types
 
-type AnthropicStreamEvent struct {
-	Type    string             `json:"type"`
-	Index   int                `json:"index,omitempty"`
-	Delta   interface{}        `json:"delta,omitempty"`
-	Message *AnthropicResponse `json:"message,omitempty"`
-}
-
 type AnthropicStreamMessageStart struct {
 	Type    string             `json:"type"`
 	Message *AnthropicResponse `json:"message"`
@@ -174,10 +153,6 @@ type AnthropicStreamMessageDelta struct {
 type AnthropicMessageDelta struct {
 	StopReason   string  `json:"stop_reason,omitempty"`
 	StopSequence *string `json:"stop_sequence,omitempty"`
-}
-
-type AnthropicStreamMessageStop struct {
-	Type string `json:"type"`
 }
 
 func generateAnthropicID() string {
@@ -1087,7 +1062,8 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 			case "image":
 				if source, ok := block["source"].(map[string]interface{}); ok {
 					sourceType, _ := source["type"].(string)
-					if sourceType == "base64" {
+					switch sourceType {
+					case "base64":
 						mediaType, _ := source["media_type"].(string)
 						data, _ := source["data"].(string)
 						if mediaType != "" && data != "" {
@@ -1098,7 +1074,7 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 								},
 							})
 						}
-					} else if sourceType == "url" {
+					case "url":
 						url, _ := source["url"].(string)
 						if url != "" {
 							if mimeType, data, err := fetchAndEncodeImage(url); err == nil {
@@ -1112,14 +1088,15 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 								log.Printf("[proxy/anthropic] failed to fetch image URL %s: %v", url, err)
 							}
 						}
-					} else {
+					default:
 						log.Printf("[proxy/anthropic] unsupported image source type: %s, skipping block", sourceType)
 					}
 				}
 			case "audio":
 				if source, ok := block["source"].(map[string]interface{}); ok {
 					sourceType, _ := source["type"].(string)
-					if sourceType == "base64" {
+					switch sourceType {
+					case "base64":
 						mediaType, _ := source["media_type"].(string)
 						data, _ := source["data"].(string)
 						if mediaType != "" && data != "" {
@@ -1130,7 +1107,7 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 								},
 							})
 						}
-					} else if sourceType == "url" {
+					case "url":
 						url, _ := source["url"].(string)
 						if url != "" {
 							if mimeType, data, err := fetchAndEncodeImage(url); err == nil {
@@ -1144,7 +1121,7 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 								log.Printf("[proxy/anthropic] failed to fetch audio URL %s: %v", url, err)
 							}
 						}
-					} else {
+					default:
 						log.Printf("[proxy/anthropic] unsupported audio source type: %s, skipping block", sourceType)
 					}
 				}

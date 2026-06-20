@@ -1148,6 +1148,8 @@ var unsupportedSchemaProps = map[string]bool{
 	"$schema":             true,
 	"additionalProperties": true,
 	"enumDescriptions":    true,
+	"exclusiveMinimum":    true,
+	"exclusiveMaximum":    true,
 }
 
 func cleanSchema(raw json.RawMessage) (json.RawMessage, error) {

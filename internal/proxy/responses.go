@@ -1405,6 +1405,10 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 
+	if err := scanner.Err(); err != nil {
+		log.Printf("[proxy/responses] stream scanner error: %v", err)
+	}
+
 	// If we get here without a completion event, send one
 	completedAt := time.Now().Unix()
 	response.Status = "completed"
