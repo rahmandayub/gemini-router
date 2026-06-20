@@ -582,10 +582,40 @@ func TestTranslateInputItemToContentDeveloperRole(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if content == nil {
-		t.Fatal("expected content")
+		t.Fatal("expected content from translateInputItemToContent (filtering happens at higher level)")
 	}
 	if content.Role != "user" {
-		t.Errorf("expected role 'user' (developer mapped to user for Gemini), got '%s'", content.Role)
+		t.Errorf("expected role 'user' (developer role falls through to default), got '%s'", content.Role)
+	}
+}
+
+func TestTranslateResponsesToGeminiDeveloperRoleAsSystemInstruction(t *testing.T) {
+	req := &ResponsesRequest{
+		Model: "gemini-2.5-flash",
+		Input: json.RawMessage(`[{"role": "developer", "content": "You are helpful"}, {"role": "user", "content": "Hello"}]`),
+	}
+
+	geminiReq, err := translateResponsesToGemini(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if geminiReq.SystemInstruction == nil {
+		t.Fatal("expected system instruction from developer role")
+	}
+	text := ""
+	for _, p := range geminiReq.SystemInstruction.Parts {
+		text += p.Text
+	}
+	if text != "You are helpful" {
+		t.Errorf("expected system instruction 'You are helpful', got '%s'", text)
+	}
+
+	if len(geminiReq.Contents) != 1 {
+		t.Fatalf("expected 1 content, got %d", len(geminiReq.Contents))
+	}
+	if geminiReq.Contents[0].Role != "user" {
+		t.Errorf("expected role 'user', got '%s'", geminiReq.Contents[0].Role)
 	}
 }
 

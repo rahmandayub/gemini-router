@@ -151,8 +151,8 @@ func TestTranslateToGemini(t *testing.T) {
 
 	// 3. Tool block (should group both consecutive tool responses into a single function block)
 	toolBlock := geminiReq.Contents[2]
-	if toolBlock.Role != "function" {
-		t.Errorf("expected block 2 role to be 'function', got '%s'", toolBlock.Role)
+	if toolBlock.Role != "user" {
+		t.Errorf("expected block 2 role to be 'user', got '%s'", toolBlock.Role)
 	}
 	if len(toolBlock.Parts) != 2 {
 		t.Errorf("expected tool block to group 2 tool responses, got %d", len(toolBlock.Parts))
@@ -244,7 +244,7 @@ func TestMapGeminiFinishReasonExtended(t *testing.T) {
 		{"RECITATION", "content_filter"},
 		{"OTHER", "content_filter"},
 		{"BLOCKLIST", "content_filter"},
-		{"MALFORMED_FUNCTION_CALL", "stop"},
+		{"MALFORMED_FUNCTION_CALL", "tool_calls"},
 		{"UNKNOWN", "stop"},
 	}
 

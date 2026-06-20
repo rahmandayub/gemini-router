@@ -240,6 +240,20 @@ func translateResponsesToGemini(req *ResponsesRequest) (*GeminiRequest, error) {
 	} else {
 		// Array of items
 		for _, item := range inputItems {
+			// Handle developer/system role items by extracting text into systemInstruction
+			if item.Role == "developer" || item.Role == "system" {
+				text := extractTextFromContent(item.Content)
+				if text != "" {
+					if geminiReq.SystemInstruction == nil {
+						geminiReq.SystemInstruction = &GeminiContent{
+							Parts: []GeminiPart{{Text: text}},
+						}
+					} else {
+						geminiReq.SystemInstruction.Parts = append(geminiReq.SystemInstruction.Parts, GeminiPart{Text: text})
+					}
+				}
+				continue
+			}
 			content, err := translateInputItemToContent(item)
 			if err != nil {
 				return nil, fmt.Errorf("failed to translate input item: %w", err)
@@ -908,6 +922,7 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 	reasoningItemID := generateItemID("rs_")
 	itemID := generateItemID("msg_")
 	var usageMetadata *GeminiUsageMetadata
+	var streamedFunctionCalls []ResponseOutputItem
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -1018,6 +1033,7 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 			// Handle function calls
 			if part.FunctionCall != nil {
 				fcItemID := generateItemID("fc_")
+				callID := generateItemID("call_")
 				if !itemStarted {
 					addEvent := ResponseStreamEvent{
 						Type:        "response.output_item.added",
@@ -1076,6 +1092,39 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 				flusher.Flush()
 				seqNum++
 
+				// Send output_item.done for the function call
+				fcItemDoneEvent := ResponseStreamEvent{
+					Type:        "response.output_item.done",
+					OutputIndex: outputIndex,
+					Item: ResponseOutputItem{
+						Type:      "function_call",
+						ID:        fcItemID,
+						Status:    "completed",
+						CallID:    callID,
+						Name:      part.FunctionCall.Name,
+						Arguments: argsStr,
+					},
+					SequenceNumber: seqNum,
+				}
+				eventData, _ = json.Marshal(fcItemDoneEvent)
+				w.Write([]byte("data: "))
+				w.Write(eventData)
+				w.Write([]byte("\n\n"))
+				flusher.Flush()
+				seqNum++
+
+				// Track for final response
+				streamedFunctionCalls = append(streamedFunctionCalls, ResponseOutputItem{
+					Type:      "function_call",
+					ID:        fcItemID,
+					Status:    "completed",
+					CallID:    callID,
+					Name:      part.FunctionCall.Name,
+					Arguments: argsStr,
+				})
+
+				outputIndex++
+				itemStarted = false
 				continue
 			}
 
@@ -1248,6 +1297,7 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 					}}),
 				})
 			}
+			outputItems = append(outputItems, streamedFunctionCalls...)
 			if currentText.Len() > 0 {
 				outputItems = append(outputItems, ResponseOutputItem{
 					Type:   "message",
@@ -1305,6 +1355,7 @@ func (h *ResponsesHandler) handleStream(w http.ResponseWriter, r *http.Request, 
 			}}),
 		})
 	}
+	outputItems = append(outputItems, streamedFunctionCalls...)
 	if currentText.Len() > 0 {
 		outputItems = append(outputItems, ResponseOutputItem{
 			Type:   "message",

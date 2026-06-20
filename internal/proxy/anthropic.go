@@ -700,14 +700,15 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 							WriteSSEEvent(w, "content_block_stop", []byte(fmt.Sprintf(`{"type":"content_block_stop","index":%d}`, blockIndex)))
 							blockIndex++
 						}
-						// Start thinking block
-						startEvent := AnthropicStreamContentBlockStart{
-							Type:  "content_block_start",
-							Index: blockIndex,
-							Block: &AnthropicRespThinkingBlock{
-								Type: "thinking",
-							},
-						}
+				// Start thinking block
+					startEvent := AnthropicStreamContentBlockStart{
+						Type:  "content_block_start",
+						Index: blockIndex,
+						Block: &AnthropicRespThinkingBlock{
+							Type:     "thinking",
+							Thinking: "",
+						},
+					}
 						eventData, _ := json.Marshal(startEvent)
 						WriteSSEEvent(w, "content_block_start", eventData)
 						currentBlockType = "thinking"

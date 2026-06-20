@@ -165,6 +165,7 @@ func extractGeminiPartsFromContent(raw json.RawMessage) []GeminiPart {
 }
 
 func fetchAndEncodeImage(url string) (mimeType string, base64Data string, err error) {
+	const maxImageSize = 20 * 1024 * 1024 // 20MB limit
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -185,9 +186,12 @@ func fetchAndEncodeImage(url string) (mimeType string, base64Data string, err er
 		}
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxImageSize+1))
 	if err != nil {
 		return "", "", fmt.Errorf("failed to read image data: %w", err)
+	}
+	if int64(len(data)) > maxImageSize {
+		return "", "", fmt.Errorf("image exceeds maximum size of %d bytes", maxImageSize)
 	}
 
 	return contentType, base64.StdEncoding.EncodeToString(data), nil
@@ -315,12 +319,13 @@ type GeminiFuncResponse struct {
 }
 
 type OpenAIResponse struct {
-	ID      string         `json:"id"`
-	Object  string         `json:"object"`
-	Created int64          `json:"created"`
-	Model   string         `json:"model"`
-	Choices []OpenAIChoice `json:"choices"`
-	Usage   *OpenAIUsage   `json:"usage,omitempty"`
+	ID                string         `json:"id"`
+	Object            string         `json:"object"`
+	Created           int64          `json:"created"`
+	Model             string         `json:"model"`
+	SystemFingerprint string         `json:"system_fingerprint"`
+	Choices           []OpenAIChoice `json:"choices"`
+	Usage             *OpenAIUsage   `json:"usage,omitempty"`
 }
 
 type OpenAIChoice struct {
@@ -427,10 +432,11 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if ok {
 			// Write first chunk immediately
 			firstChunk := OpenAIResponse{
-				ID:      id,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   openAIReq.Model,
+				ID:                id,
+				Object:            "chat.completion.chunk",
+				Created:           created,
+				Model:             openAIReq.Model,
+				SystemFingerprint: "fp_" + id[len(OpenAIIDPrefix):],
 				Choices: []OpenAIChoice{
 					{
 						Index: 0,
@@ -517,10 +523,11 @@ func (h *OpenAIHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Send error as assistant text content to render in chat
 			errText := fmt.Sprintf("\n\n[Proxy Error: failed to forward request to upstream: %v]", lastErr)
 			textChunk := OpenAIResponse{
-				ID:      id,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   openAIReq.Model,
+				ID:                id,
+				Object:            "chat.completion.chunk",
+				Created:           created,
+				Model:             openAIReq.Model,
+				SystemFingerprint: "fp_" + id[len(OpenAIIDPrefix):],
 				Choices: []OpenAIChoice{
 					{
 						Index: 0,
@@ -657,10 +664,11 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 			// Send error as assistant text content to render in chat
 			errText := fmt.Sprintf("\n\n[Proxy Error: upstream returned error: %s]", string(body))
 			textChunk := OpenAIResponse{
-				ID:      id,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
+				ID:                id,
+				Object:            "chat.completion.chunk",
+				Created:           created,
+				Model:             model,
+				SystemFingerprint: "fp_" + id[len(OpenAIIDPrefix):],
 				Choices: []OpenAIChoice{
 					{
 						Index: 0,
@@ -744,10 +752,11 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 			// Send error as assistant text content to render in chat
 			errText := fmt.Sprintf("\n\n[Proxy Error: %s]", errMsg)
 			textChunk := OpenAIResponse{
-				ID:      id,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
+				ID:                id,
+				Object:            "chat.completion.chunk",
+				Created:           created,
+				Model:             model,
+				SystemFingerprint: "fp_" + id[len(OpenAIIDPrefix):],
 				Choices: []OpenAIChoice{
 					{
 						Index: 0,
@@ -871,10 +880,11 @@ func (h *OpenAIHandler) handleStreamResponse(w http.ResponseWriter, resp *http.R
 	// Send usage chunk if stream_options.include_usage is true
 	if streamOpts != nil && streamOpts.IncludeUsage != nil && *streamOpts.IncludeUsage && lastUsageMetadata != nil {
 		usageChunk := OpenAIResponse{
-			ID:      id,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   model,
+			ID:                id,
+			Object:            "chat.completion.chunk",
+			Created:           created,
+			Model:             model,
+			SystemFingerprint: "fp_" + id[len(OpenAIIDPrefix):],
 			Choices: []OpenAIChoice{},
 			Usage: &OpenAIUsage{
 				PromptTokens:     lastUsageMetadata.PromptTokenCount,
@@ -981,11 +991,11 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 				},
 			}
 
-			if len(contents) > 0 && contents[len(contents)-1].Role == "function" {
+			if len(contents) > 0 && contents[len(contents)-1].Role == "user" && hasFunctionResponse(contents[len(contents)-1].Parts) {
 				contents[len(contents)-1].Parts = append(contents[len(contents)-1].Parts, part)
 			} else {
 				contents = append(contents, GeminiContent{
-					Role:  "function",
+					Role:  "user",
 					Parts: []GeminiPart{part},
 				})
 			}
@@ -1137,10 +1147,11 @@ func reasoningEffortToBudget(effort string) int {
 
 func translateFromGemini(resp *GeminiResponse, model string, id string, created int64) *OpenAIResponse {
 	openAIResp := &OpenAIResponse{
-		ID:      id,
-		Object:  "chat.completion",
-		Created: created,
-		Model:   model,
+		ID:                id,
+		Object:            "chat.completion",
+		Created:           created,
+		Model:             model,
+		SystemFingerprint: "fp_" + id[len(OpenAIIDPrefix):],
 	}
 
 	if len(resp.Candidates) == 0 {
@@ -1223,10 +1234,11 @@ func translateFromGemini(resp *GeminiResponse, model string, id string, created 
 
 func translateStreamChunk(resp *GeminiResponse, model string, isFirst bool, id string, created int64) *OpenAIResponse {
 	openAIResp := &OpenAIResponse{
-		ID:      id,
-		Object:  "chat.completion.chunk",
-		Created: created,
-		Model:   model,
+		ID:                id,
+		Object:            "chat.completion.chunk",
+		Created:           created,
+		Model:             model,
+		SystemFingerprint: "fp_" + id[len(OpenAIIDPrefix):],
 	}
 
 	if len(resp.Candidates) == 0 {
@@ -1290,6 +1302,15 @@ func translateStreamChunk(resp *GeminiResponse, model string, isFirst bool, id s
 	return openAIResp
 }
 
+func hasFunctionResponse(parts []GeminiPart) bool {
+	for _, p := range parts {
+		if p.FunctionResponse != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func mapGeminiFinishReason(reason string) string {
 	switch reason {
 	case "STOP":
@@ -1299,7 +1320,7 @@ func mapGeminiFinishReason(reason string) string {
 	case "SAFETY", "RECITATION", "OTHER", "BLOCKLIST":
 		return "content_filter"
 	case "MALFORMED_FUNCTION_CALL":
-		return "stop"
+		return "tool_calls"
 	default:
 		return "stop"
 	}
