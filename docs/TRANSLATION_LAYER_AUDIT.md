@@ -384,7 +384,7 @@ Conduct a comprehensive end-to-end audit of the translation layer to determine w
 |---|---|---|
 | `$schema` stripping | ✅ | Correctly stripped via `cleanSchema` |
 | `$comment` stripping | ✅ | Correctly stripped |
-| `additionalProperties` | ✅ | Preserved (Gemini supports it) |
+| `additionalProperties` | ✅ | Stripped via `cleanSchema` (Gemini rejects it) |
 | `required` fields | ✅ | Preserved |
 | `enum` values | ✅ | Preserved |
 | Nested objects | ✅ | Preserved |

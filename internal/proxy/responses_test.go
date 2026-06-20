@@ -657,8 +657,8 @@ func TestTranslateResponsesToGeminiCleanSchema(t *testing.T) {
 	var params map[string]interface{}
 	json.Unmarshal(geminiReq.Tools[0].FunctionDeclarations[0].Parameters, &params)
 
-	if _, ok := params["additionalProperties"]; !ok {
-		t.Error("expected additionalProperties to be preserved")
+	if _, ok := params["additionalProperties"]; ok {
+		t.Error("expected additionalProperties to be stripped")
 	}
 	if _, ok := params["$schema"]; ok {
 		t.Error("expected $schema to be stripped")

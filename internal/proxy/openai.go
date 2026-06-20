@@ -1144,9 +1144,10 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 }
 
 var unsupportedSchemaProps = map[string]bool{
-	"$comment":         true,
-	"$schema":          true,
-	"enumDescriptions": true,
+	"$comment":            true,
+	"$schema":             true,
+	"additionalProperties": true,
+	"enumDescriptions":    true,
 }
 
 func cleanSchema(raw json.RawMessage) (json.RawMessage, error) {

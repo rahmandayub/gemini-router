@@ -757,8 +757,8 @@ func TestCleanSchemaStripsUnsupportedProps(t *testing.T) {
 	if _, ok := result["$comment"]; ok {
 		t.Error("expected $comment to be stripped")
 	}
-	if _, ok := result["additionalProperties"]; !ok {
-		t.Error("expected additionalProperties to be preserved")
+	if _, ok := result["additionalProperties"]; ok {
+		t.Error("expected additionalProperties to be stripped")
 	}
 	if _, ok := result["properties"]; !ok {
 		t.Error("expected properties to be preserved")
