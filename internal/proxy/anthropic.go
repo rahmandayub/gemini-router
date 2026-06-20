@@ -80,7 +80,7 @@ type AnthropicResponse struct {
 	Content      []AnthropicRespBlock `json:"content"`
 	Model        string               `json:"model"`
 	StopReason   string               `json:"stop_reason,omitempty"`
-	StopSequence *string              `json:"stop_sequence,omitempty"`
+	StopSequence *string              `json:"stop_sequence"`
 	Usage        *AnthropicUsage      `json:"usage"`
 }
 
@@ -152,7 +152,7 @@ type AnthropicStreamMessageDelta struct {
 
 type AnthropicMessageDelta struct {
 	StopReason   string  `json:"stop_reason,omitempty"`
-	StopSequence *string `json:"stop_sequence,omitempty"`
+	StopSequence *string `json:"stop_sequence"`
 }
 
 func generateAnthropicID() string {
@@ -498,6 +498,7 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 	sentAny := headersWritten
 	blockIndex := 0
 	currentBlockType := ""
+	var lastUsageMetadata *GeminiUsageMetadata
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -616,6 +617,10 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 		if err := json.Unmarshal([]byte(data), &geminiResp); err != nil {
 			log.Printf("[proxy/anthropic] stream parse error: %v raw=%s", err, data)
 			continue
+		}
+
+		if geminiResp.UsageMetadata != nil {
+			lastUsageMetadata = geminiResp.UsageMetadata
 		}
 
 		if len(geminiResp.Candidates) == 0 {
@@ -814,8 +819,28 @@ func (h *AnthropicHandler) handleStreamResponse(w http.ResponseWriter, resp *htt
 		log.Printf("[proxy/anthropic] warning: no chunks sent to client")
 	}
 
-	// Ensure we send message_stop if not already sent
+	// Ensure we send message_delta + message_stop if not already sent
 	if sentMessageStart && !sentMessageStop {
+		usage := &AnthropicUsage{
+			InputTokens:              0,
+			OutputTokens:             0,
+			CacheCreationInputTokens: 0,
+			CacheReadInputTokens:     0,
+		}
+		if lastUsageMetadata != nil {
+			usage.InputTokens = lastUsageMetadata.PromptTokenCount
+			usage.OutputTokens = lastUsageMetadata.CandidatesTokenCount
+		}
+		msgDelta := AnthropicStreamMessageDelta{
+			Type: "message_delta",
+			Delta: &AnthropicMessageDelta{
+				StopReason:   "end_turn",
+				StopSequence: nil,
+			},
+			Usage: usage,
+		}
+		eventData, _ := json.Marshal(msgDelta)
+		WriteSSEEvent(w, "message_delta", eventData)
 		WriteSSEEvent(w, "message_stop", []byte(`{"type":"message_stop"}`))
 	}
 
