@@ -1196,22 +1196,67 @@ func translateToGemini(req *OpenAIRequest) (*GeminiRequest, error) {
 	return geminiReq, nil
 }
 
+func cleanSchema(raw json.RawMessage) (json.RawMessage, error) {
+	var schema map[string]interface{}
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		return nil, err
+	}
+
+	// Resolve $ref references using $defs before removing them.
+	defs, hasDefs := schema["$defs"].(map[string]interface{})
+	resolveRefs(schema, defs)
+	resolveRefsInNode(schema, defs)
+
+	// Remove keys unsupported by Gemini.
+	cleanNode(schema)
+
+	// Remove $defs after resolution is complete.
+	if hasDefs {
+		delete(schema, "$defs")
+	}
+
+	return json.Marshal(schema)
+}
+
+// resolveRefs resolves top-level $ref in a map node.
+func resolveRefs(node map[string]interface{}, defs map[string]interface{}) {
+	if ref, ok := node["$ref"].(string); ok && defs != nil {
+		path := strings.TrimPrefix(ref, "#/$defs/")
+		if resolved, ok := defs[path]; ok {
+			// Merge resolved definition into this node.
+			if resolvedMap, ok := resolved.(map[string]interface{}); ok {
+				for k, v := range resolvedMap {
+					node[k] = v
+				}
+			}
+			delete(node, "$ref")
+		}
+	}
+}
+
+// resolveRefsInNode recursively walks the schema tree, resolving $ref references.
+func resolveRefsInNode(node interface{}, defs map[string]interface{}) {
+	switch v := node.(type) {
+	case map[string]interface{}:
+		resolveRefs(v, defs)
+		for _, val := range v {
+			resolveRefsInNode(val, defs)
+		}
+	case []interface{}:
+		for _, item := range v {
+			resolveRefsInNode(item, defs)
+		}
+	}
+}
+
 var unsupportedSchemaProps = map[string]bool{
 	"$comment":            true,
+	"$ref":                true,
 	"$schema":             true,
 	"additionalProperties": true,
 	"enumDescriptions":    true,
 	"exclusiveMinimum":    true,
 	"exclusiveMaximum":    true,
-}
-
-func cleanSchema(raw json.RawMessage) (json.RawMessage, error) {
-	var schema interface{}
-	if err := json.Unmarshal(raw, &schema); err != nil {
-		return nil, err
-	}
-	cleanNode(schema)
-	return json.Marshal(schema)
 }
 
 func cleanNode(node interface{}) {
