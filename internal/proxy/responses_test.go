@@ -1012,7 +1012,7 @@ func TestTranslateResponsesToGeminiWithFrequencyPenalty(t *testing.T) {
 }
 
 func TestTranslateResponsesToGeminiWithImageContent(t *testing.T) {
-	input := json.RawMessage(`[{"role":"user","content":[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}]}]`)
+	input := json.RawMessage(`[{"role":"user","content":[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,YWJjMTIz"}}]}]`)
 	req := &ResponsesRequest{
 		Model: "gemini-2.5-flash",
 		Input: input,
@@ -1040,13 +1040,13 @@ func TestTranslateResponsesToGeminiWithImageContent(t *testing.T) {
 	if parts[1].InlineData.MimeType != "image/png" {
 		t.Errorf("expected mimeType 'image/png', got '%s'", parts[1].InlineData.MimeType)
 	}
-	if parts[1].InlineData.Data != "abc123" {
-		t.Errorf("expected data 'abc123', got '%s'", parts[1].InlineData.Data)
+	if parts[1].InlineData.Data != "YWJjMTIz" {
+		t.Errorf("expected data 'YWJjMTIz', got '%s'", parts[1].InlineData.Data)
 	}
 }
 
 func TestTranslateResponsesToGeminiWithImageOnlyContent(t *testing.T) {
-	input := json.RawMessage(`[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/abc"}}]}]`)
+	input := json.RawMessage(`[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/4AAQSkZJRg=="}}]}]`)
 	req := &ResponsesRequest{
 		Model: "gemini-2.5-flash",
 		Input: input,

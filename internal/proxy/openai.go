@@ -82,6 +82,12 @@ type OpenAIMessageContentPart struct {
 		Data   string `json:"data"`
 		Format string `json:"format,omitempty"`
 	} `json:"input_audio,omitempty"`
+	AudioURL *struct {
+		URL string `json:"url"`
+	} `json:"audio_url,omitempty"`
+	VideoURL *struct {
+		URL string `json:"url"`
+	} `json:"video_url,omitempty"`
 }
 
 func parseOpenAIContent(raw json.RawMessage) string {
@@ -120,6 +126,79 @@ func parseOpenAIContentParts(raw json.RawMessage) []OpenAIMessageContentPart {
 	return nil
 }
 
+// geminiSupportedMimeTypes is the whitelist of MIME types supported by the Gemini API
+// for inline_data parts. Source: https://ai.google.dev/gemini-api/docs/
+var geminiSupportedMimeTypes = map[string]bool{
+	"image/jpeg": true,
+	"image/png":  true,
+	"image/webp": true,
+	"image/gif":  true,
+	"image/avif": true,
+	"image/heic": true,
+	"image/heif": true,
+	"audio/wav":  true,
+	"audio/mp3":  true,
+	"audio/mpeg": true,
+	"audio/ogg":  true,
+	"video/mp4":  true,
+	"video/mpeg": true,
+	"video/ogg":  true,
+	"video/webm": true,
+	"video/quicktime": true,
+}
+
+func isSupportedMimeType(mimeType string) bool {
+	return geminiSupportedMimeTypes[mimeType]
+}
+
+func isValidBase64(s string) bool {
+	_, err := base64.StdEncoding.DecodeString(s)
+	return err == nil
+}
+
+// addInlineDataPart validates MIME type and base64 data, then appends a GeminiPart
+// with InlineData to the slice if validation passes. Returns the (possibly extended) slice
+// and a boolean indicating whether the part was added.
+func addInlineDataPart(parts []GeminiPart, mimeType, data, sourceDesc string) ([]GeminiPart, bool) {
+	if mimeType == "" {
+		log.Printf("[proxy/openai] empty MIME type for %s, dropping part", sourceDesc)
+		return parts, false
+	}
+	if !isSupportedMimeType(mimeType) {
+		log.Printf("[proxy/openai] unsupported MIME type '%s' for %s, dropping part", mimeType, sourceDesc)
+		return parts, false
+	}
+	if !isValidBase64(data) {
+		log.Printf("[proxy/openai] invalid base64 data for %s (type=%s), dropping part", sourceDesc, mimeType)
+		return parts, false
+	}
+	return append(parts, GeminiPart{
+		InlineData: &GeminiInlineData{
+			MimeType: mimeType,
+			Data:     data,
+		},
+	}), true
+}
+
+// extractURLContent extracts the MIME type and base64 data from a URL string.
+// Supports data: URIs (extracts header as MIME type) and http/https URLs (fetches remotely).
+func extractURLContent(rawURL string) (mimeType string, data string, err error) {
+	if strings.HasPrefix(rawURL, "data:") {
+		parts := strings.SplitN(rawURL, ",", 2)
+		if len(parts) != 2 {
+			return "", "", fmt.Errorf("malformed data URI")
+		}
+		header := strings.TrimPrefix(parts[0], "data:")
+		mimeType = strings.TrimSuffix(header, ";base64")
+		return mimeType, parts[1], nil
+	}
+	if strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://") {
+		mimeType, data, err := fetchAndEncodeImage(rawURL)
+		return mimeType, data, err
+	}
+	return "", "", fmt.Errorf("unsupported URL scheme")
+}
+
 func extractGeminiPartsFromContent(raw json.RawMessage) []GeminiPart {
 	parts := parseOpenAIContentParts(raw)
 	if len(parts) == 0 {
@@ -138,30 +217,14 @@ func extractGeminiPartsFromContent(raw json.RawMessage) []GeminiPart {
 			}
 		case "image_url":
 			if p.ImageURL != nil && p.ImageURL.URL != "" {
-				if strings.HasPrefix(p.ImageURL.URL, "data:") {
-					parts := strings.SplitN(p.ImageURL.URL, ",", 2)
-					if len(parts) == 2 {
-						header := parts[0]
-						mimeType := strings.TrimPrefix(header, "data:")
-						mimeType = strings.TrimSuffix(mimeType, ";base64")
-						geminiParts = append(geminiParts, GeminiPart{
-							InlineData: &GeminiInlineData{
-								MimeType: mimeType,
-								Data:     parts[1],
-							},
-						})
-					}
-				} else if strings.HasPrefix(p.ImageURL.URL, "http://") || strings.HasPrefix(p.ImageURL.URL, "https://") {
-					if mimeType, data, err := fetchAndEncodeImage(p.ImageURL.URL); err == nil {
-						geminiParts = append(geminiParts, GeminiPart{
-							InlineData: &GeminiInlineData{
-								MimeType: mimeType,
-								Data:     data,
-							},
-						})
-					} else {
-						log.Printf("[proxy/openai] failed to fetch image URL %s: %v", p.ImageURL.URL, err)
-					}
+				if p.ImageURL.Detail != "" {
+					log.Printf("[proxy/openai] image_url.detail='%s' is not supported by Gemini and will be ignored", p.ImageURL.Detail)
+				}
+				mimeType, data, err := extractURLContent(p.ImageURL.URL)
+				if err == nil {
+					geminiParts, _ = addInlineDataPart(geminiParts, mimeType, data, "image_url")
+				} else {
+					log.Printf("[proxy/openai] failed to process image URL %s: %v", p.ImageURL.URL, err)
 				}
 			}
 		case "input_audio":
@@ -170,39 +233,46 @@ func extractGeminiPartsFromContent(raw json.RawMessage) []GeminiPart {
 				if p.InputAudio.Format != "" {
 					mimeType = "audio/" + p.InputAudio.Format
 				}
-				geminiParts = append(geminiParts, GeminiPart{
-					InlineData: &GeminiInlineData{
-						MimeType: mimeType,
-						Data:     p.InputAudio.Data,
-					},
-				})
+				geminiParts, _ = addInlineDataPart(geminiParts, mimeType, p.InputAudio.Data, "input_audio")
 			}
-		case "audio_url", "video_url", "document_url", "file":
+		case "audio_url":
+			// Check dedicated AudioURL field first, then fall back to ImageURL for backward compat
+			rawURL := ""
+			if p.AudioURL != nil && p.AudioURL.URL != "" {
+				rawURL = p.AudioURL.URL
+			} else if p.ImageURL != nil && p.ImageURL.URL != "" {
+				rawURL = p.ImageURL.URL
+			}
+			if rawURL != "" {
+				mimeType, data, err := extractURLContent(rawURL)
+				if err == nil {
+					geminiParts, _ = addInlineDataPart(geminiParts, mimeType, data, "audio_url")
+				} else {
+					log.Printf("[proxy/openai] failed to fetch audio URL %s: %v", rawURL, err)
+				}
+			}
+		case "video_url":
+			rawURL := ""
+			if p.VideoURL != nil && p.VideoURL.URL != "" {
+				rawURL = p.VideoURL.URL
+			} else if p.ImageURL != nil && p.ImageURL.URL != "" {
+				rawURL = p.ImageURL.URL
+			}
+			if rawURL != "" {
+				mimeType, data, err := extractURLContent(rawURL)
+				if err == nil {
+					geminiParts, _ = addInlineDataPart(geminiParts, mimeType, data, "video_url")
+				} else {
+					log.Printf("[proxy/openai] failed to fetch video URL %s: %v", rawURL, err)
+				}
+			}
+		case "document_url", "file":
 			if p.ImageURL != nil && p.ImageURL.URL != "" {
-				if strings.HasPrefix(p.ImageURL.URL, "data:") {
-					parts := strings.SplitN(p.ImageURL.URL, ",", 2)
-					if len(parts) == 2 {
-						header := parts[0]
-						mimeType := strings.TrimPrefix(header, "data:")
-						mimeType = strings.TrimSuffix(mimeType, ";base64")
-						geminiParts = append(geminiParts, GeminiPart{
-							InlineData: &GeminiInlineData{
-								MimeType: mimeType,
-								Data:     parts[1],
-							},
-						})
-					}
-				} else if strings.HasPrefix(p.ImageURL.URL, "http://") || strings.HasPrefix(p.ImageURL.URL, "https://") {
-					if mimeType, data, err := fetchAndEncodeImage(p.ImageURL.URL); err == nil {
-						geminiParts = append(geminiParts, GeminiPart{
-							InlineData: &GeminiInlineData{
-								MimeType: mimeType,
-								Data:     data,
-							},
-						})
-					} else {
-						log.Printf("[proxy/openai] failed to fetch %s URL %s: %v", p.Type, p.ImageURL.URL, err)
-					}
+				mimeType, data, err := extractURLContent(p.ImageURL.URL)
+				if err == nil {
+					geminiParts, _ = addInlineDataPart(geminiParts, mimeType, data, p.Type)
+				} else {
+					log.Printf("[proxy/openai] failed to fetch %s URL %s: %v", p.Type, p.ImageURL.URL, err)
 				}
 			}
 		default:
@@ -212,6 +282,8 @@ func extractGeminiPartsFromContent(raw json.RawMessage) []GeminiPart {
 	return geminiParts
 }
 
+// fetchAndEncodeImage fetches any URL content (image, audio, video, etc.) and returns
+// its MIME type and base64-encoded data. Despite its name, it handles any content type.
 func fetchAndEncodeImage(url string) (mimeType string, base64Data string, err error) {
 	const maxImageSize = 20 * 1024 * 1024 // 20MB limit
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -302,13 +374,19 @@ type GeminiPart struct {
 	Thought          bool                `json:"thought,omitempty"`
 	FunctionCall     *GeminiFuncCall     `json:"functionCall,omitempty"`
 	FunctionResponse *GeminiFuncResponse `json:"functionResponse,omitempty"`
-	InlineData       *GeminiInlineData   `json:"inlineData,omitempty"`
+	InlineData       *GeminiInlineData   `json:"inline_data,omitempty"`
+	FileData         *GeminiFileData     `json:"file_data,omitempty"`
 	ThoughtSignature string              `json:"thoughtSignature,omitempty"`
 }
 
 type GeminiInlineData struct {
-	MimeType string `json:"mimeType"`
+	MimeType string `json:"mime_type"`
 	Data     string `json:"data"`
+}
+
+type GeminiFileData struct {
+	MimeType string `json:"mime_type"`
+	FileURI  string `json:"file_uri"`
 }
 
 type GeminiFuncCall struct {
@@ -1210,6 +1288,10 @@ func cleanSchema(raw json.RawMessage) (json.RawMessage, error) {
 	// Remove keys unsupported by Gemini.
 	cleanNode(schema)
 
+	// Remove maxItems from arrays whose items contain nested array-typed properties.
+	// Gemini rejects maxItems > 10 on such arrays with INVALID_ARGUMENT.
+	stripNestedArrayLimits(schema)
+
 	// Remove $defs after resolution is complete.
 	if hasDefs {
 		delete(schema, "$defs")
@@ -1254,9 +1336,15 @@ var unsupportedSchemaProps = map[string]bool{
 	"$ref":                true,
 	"$schema":             true,
 	"additionalProperties": true,
+	"const":               true,
+	"default":             true,
+	"deprecated":          true,
 	"enumDescriptions":    true,
+	"examples":            true,
 	"exclusiveMinimum":    true,
 	"exclusiveMaximum":    true,
+	"readOnly":            true,
+	"writeOnly":           true,
 }
 
 func cleanNode(node interface{}) {
@@ -1272,6 +1360,47 @@ func cleanNode(node interface{}) {
 	case []interface{}:
 		for _, item := range v {
 			cleanNode(item)
+		}
+	}
+}
+
+// hasNestedArrayInItems checks whether an object's properties contain any array-typed field.
+func hasNestedArrayInItems(obj map[string]interface{}) bool {
+	props, ok := obj["properties"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	for _, prop := range props {
+		if propMap, ok := prop.(map[string]interface{}); ok {
+			if propMap["type"] == "array" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stripNestedArrayLimits removes maxItems from array nodes whose items contain nested
+// array-typed properties. Gemini rejects maxItems > 10 on outer arrays whose items
+// include nested arrays, returning INVALID_ARGUMENT.
+func stripNestedArrayLimits(node interface{}) {
+	switch v := node.(type) {
+	case map[string]interface{}:
+		// If this node is an array with nested arrays in its items, remove maxItems.
+		if v["type"] == "array" {
+			if items, ok := v["items"].(map[string]interface{}); ok {
+				if items["type"] == "object" && hasNestedArrayInItems(items) {
+					delete(v, "maxItems")
+				}
+			}
+		}
+		// Recurse into all children.
+		for _, val := range v {
+			stripNestedArrayLimits(val)
+		}
+	case []interface{}:
+		for _, item := range v {
+			stripNestedArrayLimits(item)
 		}
 	}
 }

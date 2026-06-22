@@ -510,7 +510,7 @@ func TestParseAnthropicContentImageBase64(t *testing.T) {
 			"source": map[string]interface{}{
 				"type":       "base64",
 				"media_type": "image/png",
-				"data":       "abc123base64",
+				"data":       "YWJjMTIzYmFzZTY0",
 			},
 		},
 	})
@@ -525,8 +525,8 @@ func TestParseAnthropicContentImageBase64(t *testing.T) {
 	if parts[0].InlineData.MimeType != "image/png" {
 		t.Errorf("expected mimeType 'image/png', got '%s'", parts[0].InlineData.MimeType)
 	}
-	if parts[0].InlineData.Data != "abc123base64" {
-		t.Errorf("expected data 'abc123base64', got '%s'", parts[0].InlineData.Data)
+	if parts[0].InlineData.Data != "YWJjMTIzYmFzZTY0" {
+		t.Errorf("expected data 'YWJjMTIzYmFzZTY0', got '%s'", parts[0].InlineData.Data)
 	}
 }
 
@@ -554,7 +554,7 @@ func TestParseAnthropicContentAudioBase64(t *testing.T) {
 			"source": map[string]interface{}{
 				"type":       "base64",
 				"media_type": "audio/wav",
-				"data":       "base64audiodata",
+				"data":       "YXVkaW8gZGF0YQ==",
 			},
 		},
 	})
@@ -569,8 +569,8 @@ func TestParseAnthropicContentAudioBase64(t *testing.T) {
 	if parts[0].InlineData.MimeType != "audio/wav" {
 		t.Errorf("expected mimeType 'audio/wav', got '%s'", parts[0].InlineData.MimeType)
 	}
-	if parts[0].InlineData.Data != "base64audiodata" {
-		t.Errorf("expected data 'base64audiodata', got '%s'", parts[0].InlineData.Data)
+	if parts[0].InlineData.Data != "YXVkaW8gZGF0YQ==" {
+		t.Errorf("expected data 'YXVkaW8gZGF0YQ==', got '%s'", parts[0].InlineData.Data)
 	}
 }
 
@@ -599,7 +599,7 @@ func TestParseAnthropicContentMixedWithAudio(t *testing.T) {
 			"source": map[string]interface{}{
 				"type":       "base64",
 				"media_type": "audio/mp3",
-				"data":       "mp3data",
+				"data":       "bXAzZGF0YQ==",
 			},
 		},
 		map[string]interface{}{"type": "text", "text": "and describe it"},

@@ -339,7 +339,7 @@ func TestTranslateToGeminiDeveloperRole(t *testing.T) {
 }
 
 func TestTranslateToGeminiMultimodalContent(t *testing.T) {
-	content := json.RawMessage(`[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}]`)
+	content := json.RawMessage(`[{"type":"text","text":"What is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,YWJjMTIz"}}]`)
 	req := &OpenAIRequest{
 		Model: "gemini-2.5-flash",
 		Messages: []OpenAIMessage{
@@ -369,8 +369,8 @@ func TestTranslateToGeminiMultimodalContent(t *testing.T) {
 	if parts[1].InlineData.MimeType != "image/png" {
 		t.Errorf("expected mimeType 'image/png', got '%s'", parts[1].InlineData.MimeType)
 	}
-	if parts[1].InlineData.Data != "abc123" {
-		t.Errorf("expected data 'abc123', got '%s'", parts[1].InlineData.Data)
+	if parts[1].InlineData.Data != "YWJjMTIz" {
+		t.Errorf("expected data 'YWJjMTIz', got '%s'", parts[1].InlineData.Data)
 	}
 }
 
@@ -685,7 +685,7 @@ func TestExtractGeminiPartsFromContentTextOnly(t *testing.T) {
 }
 
 func TestExtractGeminiPartsFromContentImage(t *testing.T) {
-	raw := json.RawMessage(`[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/abc"}}]`)
+	raw := json.RawMessage(`[{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/4AAQSkZJRg=="}}]`)
 	parts := extractGeminiPartsFromContent(raw)
 	if len(parts) != 1 {
 		t.Fatalf("expected 1 part, got %d", len(parts))
@@ -699,7 +699,7 @@ func TestExtractGeminiPartsFromContentImage(t *testing.T) {
 }
 
 func TestExtractGeminiPartsFromContentMixed(t *testing.T) {
-	raw := json.RawMessage(`[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}}]`)
+	raw := json.RawMessage(`[{"type":"text","text":"describe"},{"type":"image_url","image_url":{"url":"data:image/png;base64,YWJjMTIz"}}]`)
 	parts := extractGeminiPartsFromContent(raw)
 	if len(parts) != 2 {
 		t.Fatalf("expected 2 parts, got %d", len(parts))
@@ -905,7 +905,7 @@ func TestReasoningEffortToBudget(t *testing.T) {
 }
 
 func TestExtractGeminiPartsFromContentInputAudio(t *testing.T) {
-	raw := json.RawMessage(`[{"type":"input_audio","input_audio":{"data":"base64audiodata","format":"wav"}}]`)
+	raw := json.RawMessage(`[{"type":"input_audio","input_audio":{"data":"YXVkaW9kYXRh","format":"wav"}}]`)
 	parts := extractGeminiPartsFromContent(raw)
 	if len(parts) != 1 {
 		t.Fatalf("expected 1 part, got %d", len(parts))
@@ -916,24 +916,13 @@ func TestExtractGeminiPartsFromContentInputAudio(t *testing.T) {
 	if parts[0].InlineData.MimeType != "audio/wav" {
 		t.Errorf("expected 'audio/wav', got '%s'", parts[0].InlineData.MimeType)
 	}
-	if parts[0].InlineData.Data != "base64audiodata" {
-		t.Errorf("expected 'base64audiodata', got '%s'", parts[0].InlineData.Data)
+	if parts[0].InlineData.Data != "YXVkaW9kYXRh" {
+		t.Errorf("expected 'YXVkaW9kYXRh', got '%s'", parts[0].InlineData.Data)
 	}
 }
 
 func TestExtractGeminiPartsFromContentInputAudioMP3(t *testing.T) {
-	raw := json.RawMessage(`[{"type":"input_audio","input_audio":{"data":"mp3data","format":"mp3"}}]`)
-	parts := extractGeminiPartsFromContent(raw)
-	if len(parts) != 1 {
-		t.Fatalf("expected 1 part, got %d", len(parts))
-	}
-	if parts[0].InlineData.MimeType != "audio/mp3" {
-		t.Errorf("expected 'audio/mp3', got '%s'", parts[0].InlineData.MimeType)
-	}
-}
-
-func TestExtractGeminiPartsFromContentAudioDataURI(t *testing.T) {
-	raw := json.RawMessage(`[{"type":"audio_url","image_url":{"url":"data:audio/mp3;base64,audiodata"}}]`)
+	raw := json.RawMessage(`[{"type":"input_audio","input_audio":{"data":"bXAzZGF0YQ==","format":"mp3"}}]`)
 	parts := extractGeminiPartsFromContent(raw)
 	if len(parts) != 1 {
 		t.Fatalf("expected 1 part, got %d", len(parts))
@@ -944,13 +933,33 @@ func TestExtractGeminiPartsFromContentAudioDataURI(t *testing.T) {
 	if parts[0].InlineData.MimeType != "audio/mp3" {
 		t.Errorf("expected 'audio/mp3', got '%s'", parts[0].InlineData.MimeType)
 	}
+	if parts[0].InlineData.Data != "bXAzZGF0YQ==" {
+		t.Errorf("expected 'bXAzZGF0YQ==', got '%s'", parts[0].InlineData.Data)
+	}
+}
+
+func TestExtractGeminiPartsFromContentAudioDataURI(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"audio_url","image_url":{"url":"data:audio/mp3;base64,YXVkaW9kYXRh"}}]`)
+	parts := extractGeminiPartsFromContent(raw)
+	if len(parts) != 1 {
+		t.Fatalf("expected 1 part, got %d", len(parts))
+	}
+	if parts[0].InlineData == nil {
+		t.Fatal("expected InlineData")
+	}
+	if parts[0].InlineData.MimeType != "audio/mp3" {
+		t.Errorf("expected 'audio/mp3', got '%s'", parts[0].InlineData.MimeType)
+	}
+	if parts[0].InlineData.Data != "YXVkaW9kYXRh" {
+		t.Errorf("expected 'YXVkaW9kYXRh', got '%s'", parts[0].InlineData.Data)
+	}
 }
 
 func TestExtractGeminiPartsFromContentMixedAllTypes(t *testing.T) {
 	raw := json.RawMessage(`[
 		{"type":"text","text":"Describe this"},
-		{"type":"image_url","image_url":{"url":"data:image/png;base64,abc123"}},
-		{"type":"input_audio","input_audio":{"data":"audio123","format":"wav"}}
+		{"type":"image_url","image_url":{"url":"data:image/png;base64,YWJjMTIz"}},
+		{"type":"input_audio","input_audio":{"data":"YXVkaW8xMjM=","format":"wav"}}
 	]`)
 	parts := extractGeminiPartsFromContent(raw)
 	if len(parts) != 3 {

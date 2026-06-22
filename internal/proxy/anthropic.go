@@ -1136,23 +1136,13 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 						mediaType, _ := source["media_type"].(string)
 						data, _ := source["data"].(string)
 						if mediaType != "" && data != "" {
-							parts = append(parts, GeminiPart{
-								InlineData: &GeminiInlineData{
-									MimeType: mediaType,
-									Data:     data,
-								},
-							})
+							parts, _ = addInlineDataPart(parts, mediaType, data, "anthropic_image_base64")
 						}
 					case "url":
 						url, _ := source["url"].(string)
 						if url != "" {
 							if mimeType, data, err := fetchAndEncodeImage(url); err == nil {
-								parts = append(parts, GeminiPart{
-									InlineData: &GeminiInlineData{
-										MimeType: mimeType,
-										Data:     data,
-									},
-								})
+								parts, _ = addInlineDataPart(parts, mimeType, data, "anthropic_image_url")
 							} else {
 								log.Printf("[proxy/anthropic] failed to fetch image URL %s: %v", url, err)
 							}
@@ -1169,23 +1159,13 @@ func parseAnthropicContent(content AnthropicContent, toolUseIDToName map[string]
 						mediaType, _ := source["media_type"].(string)
 						data, _ := source["data"].(string)
 						if mediaType != "" && data != "" {
-							parts = append(parts, GeminiPart{
-								InlineData: &GeminiInlineData{
-									MimeType: mediaType,
-									Data:     data,
-								},
-							})
+							parts, _ = addInlineDataPart(parts, mediaType, data, "anthropic_audio_base64")
 						}
 					case "url":
 						url, _ := source["url"].(string)
 						if url != "" {
 							if mimeType, data, err := fetchAndEncodeImage(url); err == nil {
-								parts = append(parts, GeminiPart{
-									InlineData: &GeminiInlineData{
-										MimeType: mimeType,
-										Data:     data,
-									},
-								})
+								parts, _ = addInlineDataPart(parts, mimeType, data, "anthropic_audio_url")
 							} else {
 								log.Printf("[proxy/anthropic] failed to fetch audio URL %s: %v", url, err)
 							}
